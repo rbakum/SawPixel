@@ -1,36 +1,67 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-// Iteration 2 — picture is built from ANY texture (per-pixel color).
-// Assign a Texture2D in the inspector; transparent pixels (alpha < 0.5) are skipped.
-// If no texture is assigned, a default 3-color test pattern is generated.
-// Pixels are NOT GameObjects — rendered/simulated by two ParticleSystems:
-//   HangingPS — static particles (the intact picture), no gravity.
-//   FallingPS — built-in PS physics (gravity + world collision against frame colliders).
-// Swipe (mouse / finger) to cut: the smaller side falls and breaks apart.
+// Iteration 3 — color-sorting machine.
+//   * Picture is built from any texture (per-pixel color), see LoadColors.
+//   * SPACE / tap releases the whole picture; swipe still cuts a chunk off.
+//   * Released pixels fall, funnel into a central tube, then the tube splits
+//     into three channels leading to three jars.
+//   * Jar colors are auto-derived from the texture's dominant colors.
+//     2 distinct colors  -> [c0, c1, c1];  3+ -> top three.
+//   * Each falling pixel is routed to the jar whose color is nearest to it.
+//   * Jars are infinite for now: pixels just stack up bottom-to-top.
+// Pixels are NOT GameObjects. HangingPS renders the intact picture; FallingPS
+// is a pure renderer fed by a tiny hand-written 2D simulation (physics can't
+// sort by color, so the falling/routing is done in script).
 [DisallowMultipleComponent]
 public class SliceGame : MonoBehaviour
 {
     [Header("Source")]
     public Texture2D sourceTexture;   // assign any texture; null => generated default
-    public int maxResolution = 48;    // cap on the longest side when sampling the texture
+    public int maxResolution = 48;    // cap on the longest side when sampling
+
+    [Header("Tuning")]
+    public float gravity = 16f;
+    public float funnelSteer = 9f;    // horizontal pull toward the tube
+    public float jarSteer = 13f;      // horizontal pull toward the target jar
 
     const float ORTHO_SIZE = 5f;
     const float MIN_SWIPE = 0.2f;
 
     static readonly Color FRAME_COLOR = new Color(0.9f, 0.9f, 0.9f, 1f);
     static readonly Color BG_COLOR = new Color(0.08f, 0.08f, 0.10f, 1f);
+    static readonly Color MACHINE_COLOR = new Color(0.55f, 0.58f, 0.65f, 1f);
 
     struct Px { public Vector3 pos; public Color col; }
 
-    ParticleSystem hangingPS;
-    ParticleSystem fallingPS;
+    class Faller
+    {
+        public Vector3 pos;
+        public float vy;
+        public Color col;
+        public int jar;
+        public bool sorted;
+        public bool landed;
+    }
+
+    ParticleSystem hangingPS, fallingPS;
     readonly List<Px> hanging = new List<Px>();
+    readonly List<Faller> fallers = new List<Faller>();
+    ParticleSystem.Particle[] buf = new ParticleSystem.Particle[256];
 
     Camera cam;
-    float frameHalfW, frameHalfH;
-    float pixel;            // world size of one pixel (fit to frame)
+    float W, H;            // frame half width / height
+    float pixel;
     int texW, texH;
+
+    // machine layout (world Y / X)
+    float funnelTopY, tubeTopY, tubeBotY, jarTopY, jarBottomY, pictureCenterY;
+    float tubeHalfW, funnelHalfW, jarInnerHalfW;
+    readonly float[] jarCenterX = new float[3];
+    readonly Color[] jarColor = new Color[3];
+    readonly int[] jarCount = new int[3];
+    int jarPerRow;
+
     bool dragging;
     Vector3 downPos;
 
@@ -38,14 +69,17 @@ public class SliceGame : MonoBehaviour
     {
         SetupCamera();
         ComputeFrameBounds();
-        BuildColliders();
-        BuildFrameVisual();
         var cols = LoadColors(out texW, out texH);
-        ComputePixelSize();
+        ComputeLayout();
+        BuildFrameVisual();
         BuildParticleSystems();
         BuildPicture(cols);
+        ExtractPalette();
+        BuildMachineVisual();
         UploadHanging();
     }
+
+    // ---- setup ----------------------------------------------------------
 
     void SetupCamera()
     {
@@ -66,16 +100,31 @@ public class SliceGame : MonoBehaviour
 
     void ComputeFrameBounds()
     {
-        frameHalfH = ORTHO_SIZE * 0.92f;
-        frameHalfW = ORTHO_SIZE * cam.aspect * 0.92f;
+        H = ORTHO_SIZE * 0.92f;
+        W = ORTHO_SIZE * cam.aspect * 0.92f;
     }
 
-    void ComputePixelSize()
+    void ComputeLayout()
     {
-        // Fit the picture into ~85% of the frame on both axes.
-        float fitH = frameHalfH * 2f * 0.85f / Mathf.Max(1, texH);
-        float fitW = frameHalfW * 2f * 0.85f / Mathf.Max(1, texW);
-        pixel = Mathf.Min(fitH, fitW);
+        funnelTopY = 0.35f * H;
+        tubeTopY = 0.12f * H;
+        tubeBotY = -0.05f * H;
+        jarTopY = -0.28f * H;
+        jarBottomY = -0.92f * H;
+        pictureCenterY = 0.62f * H;
+
+        // fit picture into the zone above the funnel
+        float zoneH = 0.55f * H;
+        float zoneW = 1.6f * W;
+        pixel = Mathf.Min(zoneH / Mathf.Max(1, texH), zoneW / Mathf.Max(1, texW));
+
+        tubeHalfW = Mathf.Max(pixel * 1.5f, 0.05f * W);
+        funnelHalfW = 0.45f * W;
+        jarInnerHalfW = 0.26f * W;
+        jarCenterX[0] = -0.58f * W;
+        jarCenterX[1] = 0f;
+        jarCenterX[2] = 0.58f * W;
+        jarPerRow = Mathf.Max(1, Mathf.FloorToInt(2f * jarInnerHalfW / pixel));
     }
 
     // ---- texture loading ------------------------------------------------
@@ -86,7 +135,6 @@ public class SliceGame : MonoBehaviour
         return GenerateDefault(out w, out h);
     }
 
-    // Works even when the texture is not marked Read/Write enabled.
     Color[] ReadViaBlit(Texture2D src, out int w, out int h)
     {
         int sw = src.width, sh = src.height;
@@ -95,21 +143,19 @@ public class SliceGame : MonoBehaviour
         h = Mathf.Max(1, Mathf.RoundToInt(sh * scale));
 
         var rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
-        var prevFilter = src.filterMode;
         Graphics.Blit(src, rt);
-        var prevActive = RenderTexture.active;
+        var prev = RenderTexture.active;
         RenderTexture.active = rt;
         var tmp = new Texture2D(w, h, TextureFormat.RGBA32, false);
         tmp.ReadPixels(new Rect(0, 0, w, h), 0, 0);
         tmp.Apply();
-        RenderTexture.active = prevActive;
+        RenderTexture.active = prev;
         RenderTexture.ReleaseTemporary(rt);
         var cols = tmp.GetPixels();   // bottom-to-top rows
         Destroy(tmp);
         return cols;
     }
 
-    // Default test pattern: 32x32 split into three vertical color bands.
     Color[] GenerateDefault(out int w, out int h)
     {
         w = 32; h = 32;
@@ -119,10 +165,7 @@ public class SliceGame : MonoBehaviour
         Color blue = new Color(0.25f, 0.55f, 0.95f);
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
-            {
-                Color col = x < w / 3 ? red : (x < 2 * w / 3 ? green : blue);
-                c[y * w + x] = col;
-            }
+                c[y * w + x] = x < w / 3 ? red : (x < 2 * w / 3 ? green : blue);
         return c;
     }
 
@@ -142,63 +185,112 @@ public class SliceGame : MonoBehaviour
     Vector3 PixelToWorld(int x, int y)
     {
         float wx = (x - (texW - 1) * 0.5f) * pixel;
-        float wy = (y - (texH - 1) * 0.5f) * pixel + 0.5f;
+        float wy = (y - (texH - 1) * 0.5f) * pixel + pictureCenterY;
         return new Vector3(wx, wy, 0f);
     }
 
-    // ---- frame & colliders ---------------------------------------------
+    // ---- palette --------------------------------------------------------
 
-    void BuildColliders()
+    void ExtractPalette()
     {
-        const float t = 0.5f;
-        const float zd = 10f;
-        MakeWall("Floor", new Vector3(0, -frameHalfH - t, 0), new Vector3(frameHalfW * 2 + t * 2, t * 2, zd));
-        MakeWall("LeftWall", new Vector3(-frameHalfW - t, 0, 0), new Vector3(t * 2, frameHalfH * 2, zd));
-        MakeWall("RightWall", new Vector3(frameHalfW + t, 0, 0), new Vector3(t * 2, frameHalfH * 2, zd));
+        var sum = new Dictionary<int, Vector4>();   // key -> (r,g,b, count)
+        foreach (var p in hanging)
+        {
+            int key = Quant(p.col);
+            Vector4 v = sum.TryGetValue(key, out var cur) ? cur : Vector4.zero;
+            v.x += p.col.r; v.y += p.col.g; v.z += p.col.b; v.w += 1f;
+            sum[key] = v;
+        }
+
+        var list = new List<Vector4>(sum.Values);
+        list.Sort((a, b) => b.w.CompareTo(a.w));   // by count desc
+
+        var reps = new List<Color>();
+        foreach (var v in list)
+            reps.Add(new Color(v.x / v.w, v.y / v.w, v.z / v.w, 1f));
+
+        if (reps.Count == 0) { reps.Add(Color.red); reps.Add(Color.green); reps.Add(Color.blue); }
+        while (reps.Count < 3) reps.Add(reps[reps.Count - 1]);   // 2 colors -> [c0,c1,c1]
+
+        for (int i = 0; i < 3; i++) jarColor[i] = reps[i];
     }
 
-    void MakeWall(string name, Vector3 pos, Vector3 size)
+    static int Quant(Color c)
     {
-        var go = new GameObject(name);
-        go.transform.SetParent(transform, false);
-        go.transform.position = pos;
-        go.AddComponent<BoxCollider>().size = size;
+        int r = Mathf.RoundToInt(c.r * 4f);
+        int g = Mathf.RoundToInt(c.g * 4f);
+        int b = Mathf.RoundToInt(c.b * 4f);
+        return (r * 5 + g) * 5 + b;
     }
+
+    int NearestJar(Color c)
+    {
+        int best = 0; float bd = float.MaxValue;
+        for (int i = 0; i < 3; i++)
+        {
+            float dr = c.r - jarColor[i].r, dg = c.g - jarColor[i].g, db = c.b - jarColor[i].b;
+            float d = dr * dr + dg * dg + db * db;
+            if (d < bd) { bd = d; best = i; }
+        }
+        return best;
+    }
+
+    // ---- visuals --------------------------------------------------------
 
     void BuildFrameVisual()
     {
-        var go = new GameObject("FrameVisual");
+        Line("FrameVisual", FRAME_COLOR, 0.05f, true,
+            new Vector3(-W, -H, 0), new Vector3(W, -H, 0), new Vector3(W, H, 0), new Vector3(-W, H, 0));
+    }
+
+    void BuildMachineVisual()
+    {
+        // funnel
+        Line("FunnelL", MACHINE_COLOR, 0.04f, false,
+            new Vector3(-funnelHalfW, funnelTopY, 0), new Vector3(-tubeHalfW, tubeTopY, 0));
+        Line("FunnelR", MACHINE_COLOR, 0.04f, false,
+            new Vector3(funnelHalfW, funnelTopY, 0), new Vector3(tubeHalfW, tubeTopY, 0));
+        // tube
+        Line("TubeL", MACHINE_COLOR, 0.04f, false,
+            new Vector3(-tubeHalfW, tubeTopY, 0), new Vector3(-tubeHalfW, tubeBotY, 0));
+        Line("TubeR", MACHINE_COLOR, 0.04f, false,
+            new Vector3(tubeHalfW, tubeTopY, 0), new Vector3(tubeHalfW, tubeBotY, 0));
+        // 3-way split + jars
+        for (int i = 0; i < 3; i++)
+        {
+            Line("Split" + i, MACHINE_COLOR, 0.04f, false,
+                new Vector3(0, tubeBotY, 0), new Vector3(jarCenterX[i], jarTopY, 0));
+            float l = jarCenterX[i] - jarInnerHalfW, r = jarCenterX[i] + jarInnerHalfW;
+            Line("Jar" + i, jarColor[i], 0.05f, false,
+                new Vector3(l, jarTopY, 0), new Vector3(l, jarBottomY, 0),
+                new Vector3(r, jarBottomY, 0), new Vector3(r, jarTopY, 0));
+        }
+    }
+
+    void Line(string name, Color c, float width, bool loop, params Vector3[] pts)
+    {
+        var go = new GameObject(name);
         go.transform.SetParent(transform, false);
         var lr = go.AddComponent<LineRenderer>();
         lr.useWorldSpace = true;
-        lr.loop = true;
-        lr.positionCount = 4;
-        lr.widthMultiplier = 0.05f;
+        lr.loop = loop;
         lr.numCornerVertices = 0;
+        lr.widthMultiplier = width;
         lr.material = new Material(Shader.Find("Sprites/Default"));
-        lr.startColor = lr.endColor = FRAME_COLOR;
-        lr.SetPosition(0, new Vector3(-frameHalfW, -frameHalfH, 0));
-        lr.SetPosition(1, new Vector3(frameHalfW, -frameHalfH, 0));
-        lr.SetPosition(2, new Vector3(frameHalfW, frameHalfH, 0));
-        lr.SetPosition(3, new Vector3(-frameHalfW, frameHalfH, 0));
+        lr.startColor = lr.endColor = c;
+        lr.positionCount = pts.Length;
+        lr.SetPositions(pts);
     }
 
     // ---- particle systems ----------------------------------------------
 
-    Material MakePixelMaterial()
-    {
-        var mat = new Material(Shader.Find("Sprites/Default"));
-        mat.mainTexture = Texture2D.whiteTexture;
-        return mat;
-    }
-
     void BuildParticleSystems()
     {
-        hangingPS = MakePS("HangingPS", 0f, false);
-        fallingPS = MakePS("FallingPS", 1f, true);
+        hangingPS = MakePS("HangingPS");
+        fallingPS = MakePS("FallingPS");
     }
 
-    ParticleSystem MakePS(string name, float gravity, bool collide)
+    ParticleSystem MakePS(string name)
     {
         var go = new GameObject(name);
         go.transform.SetParent(transform, false);
@@ -208,33 +300,21 @@ public class SliceGame : MonoBehaviour
         var main = ps.main;
         main.loop = false;
         main.playOnAwake = false;
-        main.maxParticles = Mathf.Max(1024, texW * texH + 16);
+        main.maxParticles = Mathf.Max(2048, texW * texH + 16);
         main.simulationSpace = ParticleSystemSimulationSpace.World;
         main.startLifetime = 1e9f;
         main.startSpeed = 0f;
         main.startSize = pixel;
         main.startColor = Color.white;
-        main.gravityModifier = gravity;
+        main.gravityModifier = 0f;
 
         var em = ps.emission; em.enabled = false;
         var sh = ps.shape; sh.enabled = false;
 
-        if (collide)
-        {
-            var col = ps.collision;
-            col.enabled = true;
-            col.type = ParticleSystemCollisionType.World;
-            col.mode = ParticleSystemCollisionMode.Collision3D;
-            col.dampen = 0.35f;
-            col.bounce = 0.15f;
-            col.lifetimeLoss = 0f;
-            col.radiusScale = 0.5f;
-        }
-
         var r = ps.GetComponent<ParticleSystemRenderer>();
         r.renderMode = ParticleSystemRenderMode.Billboard;
         r.alignment = ParticleSystemRenderSpace.View;
-        r.material = MakePixelMaterial();
+        r.material = new Material(Shader.Find("Sprites/Default")) { mainTexture = Texture2D.whiteTexture };
         r.sortMode = ParticleSystemSortMode.None;
 
         ps.Play();
@@ -244,40 +324,101 @@ public class SliceGame : MonoBehaviour
     void UploadHanging()
     {
         int n = hanging.Count;
-        var arr = new ParticleSystem.Particle[Mathf.Max(1, n)];
-        for (int i = 0; i < n; i++)
-        {
-            arr[i].position = hanging[i].pos;
-            arr[i].velocity = Vector3.zero;
-            arr[i].startSize = pixel;
-            arr[i].startColor = hanging[i].col;
-            arr[i].startLifetime = 1e9f;
-            arr[i].remainingLifetime = 1e9f;
-        }
-        hangingPS.SetParticles(arr, n);
+        EnsureBuf(n);
+        for (int i = 0; i < n; i++) FillParticle(ref buf[i], hanging[i].pos, hanging[i].col);
+        hangingPS.SetParticles(buf, n);
     }
 
-    void EmitFalling(Vector3 pos, Color col)
+    void RenderFallers()
     {
-        var ep = new ParticleSystem.EmitParams();
-        ep.position = pos;
-        ep.velocity = Vector3.zero;
-        ep.startSize = pixel;
-        ep.startColor = col;
-        ep.startLifetime = 1e9f;
-        fallingPS.Emit(ep, 1);
+        int n = fallers.Count;
+        EnsureBuf(n);
+        for (int i = 0; i < n; i++) FillParticle(ref buf[i], fallers[i].pos, fallers[i].col);
+        fallingPS.SetParticles(buf, Mathf.Max(0, n));
     }
 
-    // ---- input & cutting -----------------------------------------------
+    void EnsureBuf(int n) { if (buf.Length < Mathf.Max(1, n)) buf = new ParticleSystem.Particle[Mathf.Max(1, n)]; }
+
+    void FillParticle(ref ParticleSystem.Particle p, Vector3 pos, Color col)
+    {
+        p.position = pos;
+        p.velocity = Vector3.zero;
+        p.startSize = pixel;
+        p.startColor = col;
+        p.startLifetime = 1e9f;
+        p.remainingLifetime = 1e9f;
+    }
+
+    // ---- simulation -----------------------------------------------------
 
     void Update()
     {
+        HandleInput();
+        Simulate(Time.deltaTime);
+        RenderFallers();
+    }
+
+    void Simulate(float dt)
+    {
+        bool any = false;
+        foreach (var f in fallers)
+        {
+            if (f.landed) continue;
+            any = true;
+
+            f.vy -= gravity * dt;
+            f.pos.y += f.vy * dt;
+
+            if (!f.sorted)
+            {
+                if (f.pos.y <= tubeTopY) { f.sorted = true; f.jar = NearestJar(f.col); }
+                else if (f.pos.y <= funnelTopY)
+                    f.pos.x = Mathf.MoveTowards(f.pos.x, 0f, funnelSteer * dt);
+            }
+
+            if (f.sorted)
+            {
+                float tx = jarCenterX[f.jar];
+                f.pos.x = Mathf.MoveTowards(f.pos.x, tx, jarSteer * dt);
+                bool aligned = Mathf.Abs(f.pos.x - tx) < pixel * 0.5f;
+
+                int rows = jarCount[f.jar] / jarPerRow;
+                float landY = jarBottomY + (rows + 0.5f) * pixel;
+
+                if (!aligned && f.pos.y < jarTopY)
+                    f.pos.y = jarTopY;                 // wait at the jar mouth until lined up
+                else if (aligned && f.pos.y <= landY)
+                    Land(f);
+            }
+        }
+        // keep FallingPS alive so SetParticles renders even when nothing moves
+        if (!any && fallers.Count > 0) { /* still rendered each frame */ }
+    }
+
+    void Land(Faller f)
+    {
+        int idx = jarCount[f.jar]++;
+        int row = idx / jarPerRow;
+        int col = idx % jarPerRow;
+        float x0 = jarCenterX[f.jar] - jarInnerHalfW + pixel * 0.5f;
+        f.pos = new Vector3(x0 + col * pixel, jarBottomY + (row + 0.5f) * pixel, 0f);
+        f.vy = 0f;
+        f.landed = true;
+    }
+
+    // ---- input & release ------------------------------------------------
+
+    void HandleInput()
+    {
+        if (Input.GetKeyDown(KeyCode.Space)) ReleaseAll();
+
         if (Input.GetMouseButtonDown(0)) BeginSwipe(Input.mousePosition);
         else if (Input.GetMouseButtonUp(0)) EndSwipe(Input.mousePosition);
 
         if (Input.touchCount > 0)
         {
             var t = Input.GetTouch(0);
+            if (Input.touchCount >= 2) { ReleaseAll(); return; }
             if (t.phase == TouchPhase.Began) BeginSwipe(t.position);
             else if (t.phase == TouchPhase.Ended || t.phase == TouchPhase.Canceled) EndSwipe(t.position);
         }
@@ -300,6 +441,16 @@ public class SliceGame : MonoBehaviour
         return w;
     }
 
+    void AddFaller(Px p) => fallers.Add(new Faller { pos = p.pos, vy = 0f, col = p.col });
+
+    void ReleaseAll()
+    {
+        if (hanging.Count == 0) return;
+        foreach (var p in hanging) AddFaller(p);
+        hanging.Clear();
+        UploadHanging();
+    }
+
     void DoCut(Vector3 a, Vector3 b)
     {
         Vector3 d = b - a;
@@ -317,8 +468,7 @@ public class SliceGame : MonoBehaviour
         var fall = pos.Count <= neg.Count ? pos : neg;
         var stay = pos.Count <= neg.Count ? neg : pos;
 
-        foreach (var p in fall) EmitFalling(p.pos, p.col);
-
+        foreach (var p in fall) AddFaller(p);
         hanging.Clear();
         hanging.AddRange(stay);
         UploadHanging();
