@@ -1,32 +1,36 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-// Iteration 1 — slice game prototype.
-// 32x32 pixel picture ("I") hangs inside a frame. Swipe with mouse/finger to cut.
-// The smaller side of the cut falls and breaks into separate physical pixels.
-// Pixels are NOT GameObjects — they are rendered/simulated by two ParticleSystems.
-//   HangingPS  — static particles that hang in place (the intact picture), no gravity.
-//   FallingPS  — built-in PS physics: gravity + world collision against frame colliders.
-// Self-assembling: drop this single component on one GameObject and press Play.
+// Iteration 2 — picture is built from ANY texture (per-pixel color).
+// Assign a Texture2D in the inspector; transparent pixels (alpha < 0.5) are skipped.
+// If no texture is assigned, a default 3-color test pattern is generated.
+// Pixels are NOT GameObjects — rendered/simulated by two ParticleSystems:
+//   HangingPS — static particles (the intact picture), no gravity.
+//   FallingPS — built-in PS physics (gravity + world collision against frame colliders).
+// Swipe (mouse / finger) to cut: the smaller side falls and breaks apart.
 [DisallowMultipleComponent]
 public class SliceGame : MonoBehaviour
 {
-    const int GRID = 32;
-    const float PIXEL = 0.22f;        // world size of one pixel
-    const float CENTER_Y = 0.5f;      // vertical center of the picture
-    const float ORTHO_SIZE = 5f;      // camera half-height
-    const float MIN_SWIPE = 0.2f;     // ignore taps shorter than this
+    [Header("Source")]
+    public Texture2D sourceTexture;   // assign any texture; null => generated default
+    public int maxResolution = 48;    // cap on the longest side when sampling the texture
 
-    static readonly Color PIXEL_COLOR = new Color(0.30f, 0.75f, 1f, 1f);
+    const float ORTHO_SIZE = 5f;
+    const float MIN_SWIPE = 0.2f;
+
     static readonly Color FRAME_COLOR = new Color(0.9f, 0.9f, 0.9f, 1f);
     static readonly Color BG_COLOR = new Color(0.08f, 0.08f, 0.10f, 1f);
 
+    struct Px { public Vector3 pos; public Color col; }
+
     ParticleSystem hangingPS;
     ParticleSystem fallingPS;
-    readonly List<Vector3> hanging = new List<Vector3>();
+    readonly List<Px> hanging = new List<Px>();
 
     Camera cam;
     float frameHalfW, frameHalfH;
+    float pixel;            // world size of one pixel (fit to frame)
+    int texW, texH;
     bool dragging;
     Vector3 downPos;
 
@@ -36,8 +40,10 @@ public class SliceGame : MonoBehaviour
         ComputeFrameBounds();
         BuildColliders();
         BuildFrameVisual();
+        var cols = LoadColors(out texW, out texH);
+        ComputePixelSize();
         BuildParticleSystems();
-        BuildPicture();
+        BuildPicture(cols);
         UploadHanging();
     }
 
@@ -64,11 +70,88 @@ public class SliceGame : MonoBehaviour
         frameHalfW = ORTHO_SIZE * cam.aspect * 0.92f;
     }
 
+    void ComputePixelSize()
+    {
+        // Fit the picture into ~85% of the frame on both axes.
+        float fitH = frameHalfH * 2f * 0.85f / Mathf.Max(1, texH);
+        float fitW = frameHalfW * 2f * 0.85f / Mathf.Max(1, texW);
+        pixel = Mathf.Min(fitH, fitW);
+    }
+
+    // ---- texture loading ------------------------------------------------
+
+    Color[] LoadColors(out int w, out int h)
+    {
+        if (sourceTexture != null) return ReadViaBlit(sourceTexture, out w, out h);
+        return GenerateDefault(out w, out h);
+    }
+
+    // Works even when the texture is not marked Read/Write enabled.
+    Color[] ReadViaBlit(Texture2D src, out int w, out int h)
+    {
+        int sw = src.width, sh = src.height;
+        float scale = Mathf.Min(1f, (float)maxResolution / Mathf.Max(sw, sh));
+        w = Mathf.Max(1, Mathf.RoundToInt(sw * scale));
+        h = Mathf.Max(1, Mathf.RoundToInt(sh * scale));
+
+        var rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+        var prevFilter = src.filterMode;
+        Graphics.Blit(src, rt);
+        var prevActive = RenderTexture.active;
+        RenderTexture.active = rt;
+        var tmp = new Texture2D(w, h, TextureFormat.RGBA32, false);
+        tmp.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+        tmp.Apply();
+        RenderTexture.active = prevActive;
+        RenderTexture.ReleaseTemporary(rt);
+        var cols = tmp.GetPixels();   // bottom-to-top rows
+        Destroy(tmp);
+        return cols;
+    }
+
+    // Default test pattern: 32x32 split into three vertical color bands.
+    Color[] GenerateDefault(out int w, out int h)
+    {
+        w = 32; h = 32;
+        var c = new Color[w * h];
+        Color red = new Color(0.90f, 0.20f, 0.20f);
+        Color green = new Color(0.25f, 0.80f, 0.35f);
+        Color blue = new Color(0.25f, 0.55f, 0.95f);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                Color col = x < w / 3 ? red : (x < 2 * w / 3 ? green : blue);
+                c[y * w + x] = col;
+            }
+        return c;
+    }
+
+    void BuildPicture(Color[] cols)
+    {
+        hanging.Clear();
+        for (int y = 0; y < texH; y++)
+            for (int x = 0; x < texW; x++)
+            {
+                Color col = cols[y * texW + x];
+                if (col.a < 0.5f) continue;
+                col.a = 1f;
+                hanging.Add(new Px { pos = PixelToWorld(x, y), col = col });
+            }
+    }
+
+    Vector3 PixelToWorld(int x, int y)
+    {
+        float wx = (x - (texW - 1) * 0.5f) * pixel;
+        float wy = (y - (texH - 1) * 0.5f) * pixel + 0.5f;
+        return new Vector3(wx, wy, 0f);
+    }
+
+    // ---- frame & colliders ---------------------------------------------
+
     void BuildColliders()
     {
-        // 3D box colliders (invisible) so FallingPS world collision has something to hit.
-        const float t = 0.5f;   // thickness
-        const float zd = 10f;   // depth so z=0 particles always overlap
+        const float t = 0.5f;
+        const float zd = 10f;
         MakeWall("Floor", new Vector3(0, -frameHalfH - t, 0), new Vector3(frameHalfW * 2 + t * 2, t * 2, zd));
         MakeWall("LeftWall", new Vector3(-frameHalfW - t, 0, 0), new Vector3(t * 2, frameHalfH * 2, zd));
         MakeWall("RightWall", new Vector3(frameHalfW + t, 0, 0), new Vector3(t * 2, frameHalfH * 2, zd));
@@ -79,8 +162,7 @@ public class SliceGame : MonoBehaviour
         var go = new GameObject(name);
         go.transform.SetParent(transform, false);
         go.transform.position = pos;
-        var bc = go.AddComponent<BoxCollider>();
-        bc.size = size;
+        go.AddComponent<BoxCollider>().size = size;
     }
 
     void BuildFrameVisual()
@@ -100,6 +182,8 @@ public class SliceGame : MonoBehaviour
         lr.SetPosition(2, new Vector3(frameHalfW, frameHalfH, 0));
         lr.SetPosition(3, new Vector3(-frameHalfW, frameHalfH, 0));
     }
+
+    // ---- particle systems ----------------------------------------------
 
     Material MakePixelMaterial()
     {
@@ -124,12 +208,12 @@ public class SliceGame : MonoBehaviour
         var main = ps.main;
         main.loop = false;
         main.playOnAwake = false;
-        main.maxParticles = GRID * GRID + 16;
+        main.maxParticles = Mathf.Max(1024, texW * texH + 16);
         main.simulationSpace = ParticleSystemSimulationSpace.World;
         main.startLifetime = 1e9f;
         main.startSpeed = 0f;
-        main.startSize = PIXEL;
-        main.startColor = PIXEL_COLOR;
+        main.startSize = pixel;
+        main.startColor = Color.white;
         main.gravityModifier = gravity;
 
         var em = ps.emission; em.enabled = false;
@@ -157,66 +241,40 @@ public class SliceGame : MonoBehaviour
         return ps;
     }
 
-    // Letter "I" pattern on a 32x32 grid.
-    static bool IsLetterI(int x, int y)
-    {
-        bool topBar = y >= 26 && y <= 31 && x >= 6 && x <= 25;
-        bool bottomBar = y >= 0 && y <= 5 && x >= 6 && x <= 25;
-        bool stem = x >= 13 && x <= 18;
-        return topBar || bottomBar || stem;
-    }
-
-    void BuildPicture()
-    {
-        hanging.Clear();
-        for (int y = 0; y < GRID; y++)
-            for (int x = 0; x < GRID; x++)
-                if (IsLetterI(x, y))
-                    hanging.Add(GridToWorld(x, y));
-    }
-
-    Vector3 GridToWorld(int x, int y)
-    {
-        float wx = (x - (GRID - 1) * 0.5f) * PIXEL;
-        float wy = (y - (GRID - 1) * 0.5f) * PIXEL + CENTER_Y;
-        return new Vector3(wx, wy, 0f);
-    }
-
-    // Push the current hanging list into HangingPS as static particles.
     void UploadHanging()
     {
         int n = hanging.Count;
         var arr = new ParticleSystem.Particle[Mathf.Max(1, n)];
         for (int i = 0; i < n; i++)
         {
-            arr[i].position = hanging[i];
+            arr[i].position = hanging[i].pos;
             arr[i].velocity = Vector3.zero;
-            arr[i].startSize = PIXEL;
-            arr[i].startColor = PIXEL_COLOR;
+            arr[i].startSize = pixel;
+            arr[i].startColor = hanging[i].col;
             arr[i].startLifetime = 1e9f;
             arr[i].remainingLifetime = 1e9f;
         }
         hangingPS.SetParticles(arr, n);
     }
 
-    void EmitFalling(Vector3 pos)
+    void EmitFalling(Vector3 pos, Color col)
     {
         var ep = new ParticleSystem.EmitParams();
         ep.position = pos;
         ep.velocity = Vector3.zero;
-        ep.startSize = PIXEL;
-        ep.startColor = PIXEL_COLOR;
+        ep.startSize = pixel;
+        ep.startColor = col;
         ep.startLifetime = 1e9f;
         fallingPS.Emit(ep, 1);
     }
 
+    // ---- input & cutting -----------------------------------------------
+
     void Update()
     {
-        // Mouse (editor / desktop)
         if (Input.GetMouseButtonDown(0)) BeginSwipe(Input.mousePosition);
         else if (Input.GetMouseButtonUp(0)) EndSwipe(Input.mousePosition);
 
-        // Touch (mobile)
         if (Input.touchCount > 0)
         {
             var t = Input.GetTouch(0);
@@ -225,11 +283,7 @@ public class SliceGame : MonoBehaviour
         }
     }
 
-    void BeginSwipe(Vector3 screen)
-    {
-        downPos = ScreenToWorld(screen);
-        dragging = true;
-    }
+    void BeginSwipe(Vector3 screen) { downPos = ScreenToWorld(screen); dragging = true; }
 
     void EndSwipe(Vector3 screen)
     {
@@ -240,7 +294,7 @@ public class SliceGame : MonoBehaviour
 
     Vector3 ScreenToWorld(Vector3 screen)
     {
-        screen.z = -cam.transform.position.z; // distance to z=0 plane
+        screen.z = -cam.transform.position.z;
         var w = cam.ScreenToWorldPoint(screen);
         w.z = 0f;
         return w;
@@ -249,26 +303,21 @@ public class SliceGame : MonoBehaviour
     void DoCut(Vector3 a, Vector3 b)
     {
         Vector3 d = b - a;
-        if (d.magnitude < MIN_SWIPE) return;
-        if (hanging.Count == 0) return;
+        if (d.magnitude < MIN_SWIPE || hanging.Count == 0) return;
 
-        var sidePos = new List<Vector3>();
-        var sideNeg = new List<Vector3>();
+        var pos = new List<Px>();
+        var neg = new List<Px>();
         foreach (var p in hanging)
         {
-            // sign of cross(d, p-a) decides the side of the infinite line a->b
-            float cross = d.x * (p.y - a.y) - d.y * (p.x - a.x);
-            if (cross > 0f) sidePos.Add(p); else sideNeg.Add(p);
+            float cross = d.x * (p.pos.y - a.y) - d.y * (p.pos.x - a.x);
+            if (cross > 0f) pos.Add(p); else neg.Add(p);
         }
+        if (pos.Count == 0 || neg.Count == 0) return;
 
-        // Line must actually cross the shape (both sides non-empty).
-        if (sidePos.Count == 0 || sideNeg.Count == 0) return;
+        var fall = pos.Count <= neg.Count ? pos : neg;
+        var stay = pos.Count <= neg.Count ? neg : pos;
 
-        // Smaller side falls.
-        List<Vector3> fall = sidePos.Count <= sideNeg.Count ? sidePos : sideNeg;
-        List<Vector3> stay = sidePos.Count <= sideNeg.Count ? sideNeg : sidePos;
-
-        foreach (var p in fall) EmitFalling(p);
+        foreach (var p in fall) EmitFalling(p.pos, p.col);
 
         hanging.Clear();
         hanging.AddRange(stay);
