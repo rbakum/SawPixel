@@ -413,9 +413,12 @@ MonoBehaviour:
   capacityMin: 50
   capacityMax: 100
   colorMatch: 0.3
-  tubeCapacity: 100
+  tubeCapacity: 200
   fingerPixels: 4.5
   eraseImpulse: 4
+  cutGuideWidthPixels: 0.22
+  cutGuideDashPixels: 0.85
+  cutGuideGapPixels: 0.55
 --- !u!4 &1379775640
 Transform:
   m_ObjectHideFlags: 0
