@@ -682,24 +682,54 @@ public class SliceGame : MonoBehaviour
     {
         if (hanging.Count == 0) return;
         float r2 = eraseRadius * eraseRadius;
-        bool changed = false;
-        for (int i = hanging.Count - 1; i >= 0; i--)
+
+        // pixels inside the finger radius are the ones chipping off this frame
+        var remove = new List<int>();
+        for (int i = 0; i < hanging.Count; i++)
         {
-            var p = hanging[i];
-            float dx = p.pos.x - center.x, dy = p.pos.y - center.y;
-            if (dx * dx + dy * dy > r2) continue;
-
-            // diagonal pop: outward sideways + a bit up; gravity takes over after
-            float dir = dx >= 0f ? 1f : -1f;
-            if (Mathf.Abs(dx) < pixel) dir = Random.value < 0.5f ? -1f : 1f;
-            float vx = dir * eraseImpulse * Random.Range(0.6f, 1.1f);
-            float vy = eraseImpulse * Random.Range(0.35f, 0.7f);
-            fallers.Add(new Faller { pos = p.pos, vx = vx, vy = vy, col = p.col, pi = p.pi });
-
-            hanging.RemoveAt(i);
-            changed = true;
+            float dx = hanging[i].pos.x - center.x, dy = hanging[i].pos.y - center.y;
+            if (dx * dx + dy * dy <= r2) remove.Add(i);
         }
-        if (changed) UploadHanging();
+        if (remove.Count == 0) return;
+
+        var removeSet = new HashSet<int>(remove);
+        float nr2 = eraseRadius * 3f; nr2 *= nr2;   // neighborhood to analyze
+
+        foreach (int idx in remove)
+        {
+            var p = hanging[idx];
+
+            // repulsion away from nearby pixels that are NOT being destroyed:
+            // each surviving neighbor pushes this pixel outward (inverse-square),
+            // so it flies toward open space, never back into the picture.
+            Vector2 away = Vector2.zero;
+            for (int j = 0; j < hanging.Count; j++)
+            {
+                if (removeSet.Contains(j)) continue;
+                float dx = p.pos.x - hanging[j].pos.x, dy = p.pos.y - hanging[j].pos.y;
+                float d2 = dx * dx + dy * dy;
+                if (d2 > nr2 || d2 < 1e-6f) continue;
+                away += new Vector2(dx, dy) / d2;
+            }
+
+            Vector2 dir;
+            if (away.sqrMagnitude > 1e-5f) dir = away.normalized;
+            else
+            {
+                // fully surrounded (no open side nearby) — fan out from the touch point
+                Vector2 fc = new Vector2(p.pos.x - center.x, p.pos.y - center.y);
+                if (fc.sqrMagnitude > 1e-5f) dir = fc.normalized;
+                else { float a = Random.value * Mathf.PI * 2f; dir = new Vector2(Mathf.Cos(a), Mathf.Sin(a)); }
+            }
+
+            float mag = eraseImpulse * Random.Range(0.7f, 1.1f);
+            float vx = dir.x * mag;
+            float vy = dir.y * mag + eraseImpulse * 0.25f;   // slight upward arc for feel
+            fallers.Add(new Faller { pos = p.pos, vx = vx, vy = vy, col = p.col, pi = p.pi });
+        }
+
+        for (int k = remove.Count - 1; k >= 0; k--) hanging.RemoveAt(remove[k]);
+        UploadHanging();
     }
 
     Vector3 ScreenToWorld(Vector3 screen)
