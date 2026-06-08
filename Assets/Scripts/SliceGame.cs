@@ -30,6 +30,10 @@ public class SliceGame : MonoBehaviour
     public int capacityMax = 15;
     public float colorMatch = 0.30f;  // max color distance a jar will accept
 
+    [Header("Erase")]
+    public float fingerPixels = 4.5f; // erase radius in pixel-widths (finger size)
+    public float eraseImpulse = 4f;   // how hard chipped pixels fly out
+
     const float ORTHO_SIZE = 5f;
     const float MIN_SWIPE = 0.2f;
     const int PALETTE_MAX = 5;
@@ -43,6 +47,7 @@ public class SliceGame : MonoBehaviour
     class Faller
     {
         public Vector3 pos;
+        public float vx;       // horizontal velocity (impulse pop in the picture zone)
         public float vy;
         public Color col;
         public int pi;         // palette index this pixel belongs to
@@ -77,6 +82,7 @@ public class SliceGame : MonoBehaviour
 
     float funnelTopY, tubeTopY, tubeBotY, jarTopY, jarBottomY, pictureCenterY, previewY;
     float tubeHalfW, funnelHalfW, jarInnerHalfW, previewHalfW, previewHalfH;
+    float eraseRadius;
     readonly float[] jarCenterX = new float[3];
     int jarPerRow, backlogPerRow, backlogCapacity;
 
@@ -90,9 +96,6 @@ public class SliceGame : MonoBehaviour
     bool clogged;
     TextMesh statusText;
     Font uiFont;
-
-    bool dragging;
-    Vector3 downPos;
 
     void Start()
     {
@@ -163,6 +166,8 @@ public class SliceGame : MonoBehaviour
 
         backlogPerRow = Mathf.Max(1, Mathf.FloorToInt(2f * tubeHalfW / pixel));
         backlogCapacity = backlogPerRow * Mathf.Max(2, Mathf.FloorToInt((tubeTopY - tubeBotY) / pixel));
+
+        eraseRadius = pixel * fingerPixels;
     }
 
     void LoadFont()
@@ -586,6 +591,14 @@ public class SliceGame : MonoBehaviour
                 }
                 else if (f.pos.y <= funnelTopY)
                     f.pos.x = Mathf.MoveTowards(f.pos.x, 0f, funnelSteer * dt);
+                else
+                {
+                    // picture zone: fly out with the chip impulse, bounce off the walls
+                    f.pos.x += f.vx * dt;
+                    float lim = W - pixel * 0.5f;
+                    if (f.pos.x > lim) { f.pos.x = lim; f.vx = -f.vx * 0.5f; }
+                    else if (f.pos.x < -lim) { f.pos.x = -lim; f.vx = -f.vx * 0.5f; }
+                }
             }
 
             if (f.routed && f.jar >= 0) StepIntoJar(f, dt);
@@ -647,29 +660,46 @@ public class SliceGame : MonoBehaviour
 
     // ---- input ----------------------------------------------------------
 
+    // Touch/hold erases: every frame the finger is down, all hanging pixels
+    // within a finger-sized radius chip off and fly out with a diagonal impulse.
     void HandleInput()
     {
         if (Input.GetKeyDown(KeyCode.Space)) ReleaseAll();
 
-        if (Input.GetMouseButtonDown(0)) BeginSwipe(Input.mousePosition);
-        else if (Input.GetMouseButtonUp(0)) EndSwipe(Input.mousePosition);
-
+        bool down = false;
+        Vector3 screen = default;
         if (Input.touchCount > 0)
         {
             var t = Input.GetTouch(0);
-            if (Input.touchCount >= 2) { ReleaseAll(); return; }
-            if (t.phase == TouchPhase.Began) BeginSwipe(t.position);
-            else if (t.phase == TouchPhase.Ended || t.phase == TouchPhase.Canceled) EndSwipe(t.position);
+            if (t.phase != TouchPhase.Ended && t.phase != TouchPhase.Canceled) { down = true; screen = t.position; }
         }
+        else if (Input.GetMouseButton(0)) { down = true; screen = Input.mousePosition; }
+
+        if (down) Erase(ScreenToWorld(screen));
     }
 
-    void BeginSwipe(Vector3 screen) { downPos = ScreenToWorld(screen); dragging = true; }
-
-    void EndSwipe(Vector3 screen)
+    void Erase(Vector3 center)
     {
-        if (!dragging) return;
-        dragging = false;
-        DoCut(downPos, ScreenToWorld(screen));
+        if (hanging.Count == 0) return;
+        float r2 = eraseRadius * eraseRadius;
+        bool changed = false;
+        for (int i = hanging.Count - 1; i >= 0; i--)
+        {
+            var p = hanging[i];
+            float dx = p.pos.x - center.x, dy = p.pos.y - center.y;
+            if (dx * dx + dy * dy > r2) continue;
+
+            // diagonal pop: outward sideways + a bit up; gravity takes over after
+            float dir = dx >= 0f ? 1f : -1f;
+            if (Mathf.Abs(dx) < pixel) dir = Random.value < 0.5f ? -1f : 1f;
+            float vx = dir * eraseImpulse * Random.Range(0.6f, 1.1f);
+            float vy = eraseImpulse * Random.Range(0.35f, 0.7f);
+            fallers.Add(new Faller { pos = p.pos, vx = vx, vy = vy, col = p.col, pi = p.pi });
+
+            hanging.RemoveAt(i);
+            changed = true;
+        }
+        if (changed) UploadHanging();
     }
 
     Vector3 ScreenToWorld(Vector3 screen)
@@ -690,26 +720,4 @@ public class SliceGame : MonoBehaviour
         UploadHanging();
     }
 
-    void DoCut(Vector3 a, Vector3 b)
-    {
-        Vector3 d = b - a;
-        if (d.magnitude < MIN_SWIPE || hanging.Count == 0) return;
-
-        var pos = new List<Px>();
-        var neg = new List<Px>();
-        foreach (var p in hanging)
-        {
-            float cross = d.x * (p.pos.y - a.y) - d.y * (p.pos.x - a.x);
-            if (cross > 0f) pos.Add(p); else neg.Add(p);
-        }
-        if (pos.Count == 0 || neg.Count == 0) return;
-
-        var fall = pos.Count <= neg.Count ? pos : neg;
-        var stay = pos.Count <= neg.Count ? neg : pos;
-
-        foreach (var p in fall) AddFaller(p);
-        hanging.Clear();
-        hanging.AddRange(stay);
-        UploadHanging();
-    }
 }
