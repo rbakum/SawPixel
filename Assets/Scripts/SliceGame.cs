@@ -4,12 +4,12 @@ using UnityEngine;
 // Iteration 4 — jars with capacity + a queue ("layers") and clog risk.
 //   * Picture is built from any texture (per-pixel color).
 //   * SPACE / two-finger tap releases the whole picture; swipe cuts a chunk.
-//   * Pixels funnel into a central tube, then route to one of three ACTIVE jars
+//   * Pixels funnel into a central tube, then route to one of two ACTIVE jars
 //     by nearest color (only if that jar still has capacity).
 //   * Each jar has a random small capacity and a random color drawn from the
 //     texture palette. A number on the jar shows how many pixels it still needs.
 //   * When a jar is full its pixels are consumed and the next jar from the queue
-//     slides into that slot. The next layer (3 upcoming jars) is shown as a
+//     slides into that slot. The next layer is shown as a
 //     preview row with their colors and numbers.
 //   * A pixel with no matching active jar piles up in the tube. If the tube
 //     fills to the top it CLOGS — the fail state the player must avoid.
@@ -31,17 +31,23 @@ public class SliceGame : MonoBehaviour
     public float colorMatch = 0.30f;  // max color distance a jar will accept
     public int tubeCapacity = 0;      // 0 = auto (fills tube geometry)
 
-    [Header("Erase")]
-    public float fingerPixels = 3.6f; // erase radius in pixel-widths (finger size)
+    [Header("Cut")]
+    public float fingerPixels = 3.6f; // kept for existing scene tuning; cut width in pixel-widths
     public float eraseImpulse = 4f;   // how hard chipped pixels fly out
+    public float cutGuideWidthPixels = 0.22f;
+    public float cutGuideDashPixels = 0.85f;
+    public float cutGuideGapPixels = 0.55f;
 
     const float ORTHO_SIZE = 5f;
     const float MIN_SWIPE = 0.2f;
     const int PALETTE_MAX = 5;
+    const int ACTIVE_JARS = 2;
+    const int CUT_GUIDE_SORT_ORDER = 100;
 
     static readonly Color FRAME_COLOR = new Color(0.9f, 0.9f, 0.9f, 1f);
     static readonly Color BG_COLOR = new Color(0.96f, 0.96f, 0.86f, 1f);
     static readonly Color MACHINE_COLOR = new Color(0.55f, 0.58f, 0.65f, 1f);
+    static readonly Color CUT_GUIDE_COLOR = new Color(1f, 0f, 0f, 1f);
 
     struct Px { public Vector3 pos; public Color col; public int pi; public int x, y; }   // pi = palette index
 
@@ -52,7 +58,7 @@ public class SliceGame : MonoBehaviour
         public float vy;
         public Color col;
         public int pi;         // palette index this pixel belongs to
-        public int jar;        // 0..2 active jar
+        public int jar;        // active jar index
         public bool routed;    // has passed the tube entry decision point
         public bool inTube;    // parked in the tube buffer, waiting for a free jar
         public bool landed;
@@ -81,10 +87,12 @@ public class SliceGame : MonoBehaviour
     }
 
     ParticleSystem hangingPS, fallingPS;
+    ParticleSystem cutGuidePS;
     readonly List<Px> hanging = new List<Px>();
     readonly List<Faller> fallers = new List<Faller>();
     readonly List<DetachedChunk> detachedChunks = new List<DetachedChunk>();
     ParticleSystem.Particle[] buf = new ParticleSystem.Particle[256];
+    ParticleSystem.Particle[] cutBuf = new ParticleSystem.Particle[256];
 
     Camera cam;
     float W, H, pixel;
@@ -93,15 +101,18 @@ public class SliceGame : MonoBehaviour
     float funnelTopY, tubeTopY, tubeBotY, jarTopY, jarBottomY, pictureCenterY, previewY;
     float tubeHalfW, funnelHalfW, jarInnerHalfW, previewHalfW, previewHalfH;
     float eraseRadius;
-    readonly float[] jarCenterX = new float[3];
+    readonly float[] jarCenterX = new float[ACTIVE_JARS];
     int jarPerRow, backlogPerRow, backlogCapacity;
 
     readonly List<Color> palette = new List<Color>();
     int[] paletteCount;
-    readonly Slot[] slots = new Slot[3];
+    readonly Slot[] slots = new Slot[ACTIVE_JARS];
     readonly Queue<JarDef> queue = new Queue<JarDef>();
-    LineRenderer[] previewBox = new LineRenderer[3];
-    TextMesh[] previewText = new TextMesh[3];
+    LineRenderer[] previewBox = new LineRenderer[ACTIVE_JARS];
+    TextMesh[] previewText = new TextMesh[ACTIVE_JARS];
+    LineRenderer cutStartRing, cutCurrentRing;
+    bool cutting;
+    Vector3 cutStart, cutCurrent;
 
     bool clogged;
     TextMesh statusText;
@@ -121,6 +132,7 @@ public class SliceGame : MonoBehaviour
         AssignPaletteIndices();
         BuildMachineVisual();
         BuildJarsAndQueue();
+        BuildCutPreviewVisual();
         UploadHanging();
     }
 
@@ -166,9 +178,8 @@ public class SliceGame : MonoBehaviour
         tubeHalfW = Mathf.Max(pixel * 3f, 0.08f * W);
         funnelHalfW = 0.45f * W;
         jarInnerHalfW = 0.26f * W;
-        jarCenterX[0] = -0.58f * W;
-        jarCenterX[1] = 0f;
-        jarCenterX[2] = 0.58f * W;
+        jarCenterX[0] = -0.34f * W;
+        jarCenterX[1] = 0.34f * W;
         jarPerRow = Mathf.Max(1, Mathf.FloorToInt(2f * jarInnerHalfW / pixel));
 
         previewHalfW = 0.14f * W;
@@ -354,7 +365,7 @@ public class SliceGame : MonoBehaviour
     {
         foreach (var def in BuildSequence()) queue.Enqueue(def);
 
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < ACTIVE_JARS; i++)
         {
             var s = new Slot();
             float l = jarCenterX[i] - jarInnerHalfW, r = jarCenterX[i] + jarInnerHalfW;
@@ -367,7 +378,7 @@ public class SliceGame : MonoBehaviour
             else EmptySlot(i);
         }
 
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < ACTIVE_JARS; i++)
         {
             float cx = jarCenterX[i];
             previewBox[i] = MakeLine("PrevBox" + i, Color.white, 0.035f, true,
@@ -430,7 +441,7 @@ public class SliceGame : MonoBehaviour
     void RefreshPreview()
     {
         var arr = queue.ToArray();
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < ACTIVE_JARS; i++)
         {
             if (i < arr.Length)
             {
@@ -448,7 +459,7 @@ public class SliceGame : MonoBehaviour
     // (jar capacities == pixel counts) stay consistent.
     int ChooseJar(int pi)
     {
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < ACTIVE_JARS; i++)
             if (slots[i].pi == pi && slots[i].reserved < slots[i].capacity)
                 return i;
         return -1;
@@ -472,7 +483,7 @@ public class SliceGame : MonoBehaviour
             new Vector3(-tubeHalfW, tubeTopY, 0), new Vector3(-tubeHalfW, tubeBotY, 0));
         MakeLine("TubeR", MACHINE_COLOR, 0.04f, false,
             new Vector3(tubeHalfW, tubeTopY, 0), new Vector3(tubeHalfW, tubeBotY, 0));
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < ACTIVE_JARS; i++)
             MakeLine("Split" + i, MACHINE_COLOR, 0.04f, false,
                 new Vector3(0, tubeBotY, 0), new Vector3(jarCenterX[i], jarTopY, 0));
     }
@@ -516,6 +527,20 @@ public class SliceGame : MonoBehaviour
     {
         hangingPS = MakePS("HangingPS");
         fallingPS = MakePS("FallingPS");
+    }
+
+    void BuildCutPreviewVisual()
+    {
+        cutGuidePS = MakePS("CutGuidePS");
+        var main = cutGuidePS.main;
+        main.maxParticles = 4096;
+        cutGuidePS.GetComponent<ParticleSystemRenderer>().sortingOrder = CUT_GUIDE_SORT_ORDER;
+
+        cutStartRing = MakeLine("CutStartRing", CUT_GUIDE_COLOR, pixel * 0.12f, true, Vector3.zero);
+        cutCurrentRing = MakeLine("CutCurrentRing", CUT_GUIDE_COLOR, pixel * 0.12f, true, Vector3.zero);
+        cutStartRing.sortingOrder = CUT_GUIDE_SORT_ORDER + 1;
+        cutCurrentRing.sortingOrder = CUT_GUIDE_SORT_ORDER + 1;
+        SetCutPreviewVisible(false);
     }
 
     ParticleSystem MakePS(string name)
@@ -585,6 +610,12 @@ public class SliceGame : MonoBehaviour
         p.startColor = col;
         p.startLifetime = 1e9f;
         p.remainingLifetime = 1e9f;
+    }
+
+    void FillGuideParticle(ref ParticleSystem.Particle p, Vector3 pos, Color col)
+    {
+        FillParticle(ref p, pos, col);
+        p.startSize = Mathf.Max(0.02f, pixel * cutGuideWidthPixels);
     }
 
     // ---- simulation -----------------------------------------------------
@@ -714,83 +745,152 @@ public class SliceGame : MonoBehaviour
 
     // ---- input ----------------------------------------------------------
 
-    // Touch/hold erases: every frame the finger is down, all hanging pixels
-    // within a finger-sized radius chip off and fly out with a diagonal impulse.
+    // First tap anchors point A. Dragging previews point B and the cut segment.
+    // Releasing cuts the picture along the segment and shatters the smaller side.
     void HandleInput()
     {
         if (Input.GetKeyDown(KeyCode.Space)) ReleaseAll();
 
-        bool down = false;
-        Vector3 screen = default;
         if (Input.touchCount > 0)
         {
             var t = Input.GetTouch(0);
-            if (t.phase != TouchPhase.Ended && t.phase != TouchPhase.Canceled) { down = true; screen = t.position; }
+            Vector3 world = ScreenToWorld(t.position);
+            if (t.phase == TouchPhase.Began) BeginCut(world);
+            else if (t.phase == TouchPhase.Moved || t.phase == TouchPhase.Stationary) UpdateCut(world);
+            else if (t.phase == TouchPhase.Ended || t.phase == TouchPhase.Canceled) EndCut(world);
+            return;
         }
-        else if (Input.GetMouseButton(0)) { down = true; screen = Input.mousePosition; }
 
-        if (down) Erase(ScreenToWorld(screen));
+        if (Input.GetMouseButtonDown(0)) BeginCut(ScreenToWorld(Input.mousePosition));
+        else if (Input.GetMouseButton(0)) UpdateCut(ScreenToWorld(Input.mousePosition));
+        else if (Input.GetMouseButtonUp(0)) EndCut(ScreenToWorld(Input.mousePosition));
     }
 
-    void Erase(Vector3 center)
+    void BeginCut(Vector3 world)
     {
-        if (hanging.Count == 0) return;
-        float r2 = eraseRadius * eraseRadius;
+        cutting = true;
+        cutStart = cutCurrent = world;
+        SetCutPreviewVisible(true);
+        UpdateCutPreview();
+    }
+
+    void SetCutPreviewVisible(bool visible)
+    {
+        if (cutStartRing != null) cutStartRing.enabled = visible;
+        if (cutCurrentRing != null) cutCurrentRing.enabled = visible;
+        if (!visible && cutGuidePS != null) cutGuidePS.SetParticles(cutBuf, 0);
+    }
+
+    void UpdateCutPreview()
+    {
+        UpdateCircle(cutStartRing, cutStart, pixel * 0.72f);
+        UpdateCircle(cutCurrentRing, cutCurrent, pixel * 0.72f);
+
+        float len = (cutCurrent - cutStart).magnitude;
+        if (len < 1e-4f)
+        {
+            cutGuidePS.SetParticles(cutBuf, 0);
+            return;
+        }
 
         bool[,] occupied = BuildHangingGrid();
+        Vector3 dir = (cutCurrent - cutStart) / len;
+        float sampleStep = Mathf.Max(0.01f, pixel * 0.13f);
+        int maxSamples = Mathf.CeilToInt(len / sampleStep) + 1;
+        if (cutBuf.Length < maxSamples) cutBuf = new ParticleSystem.Particle[maxSamples];
 
-        // pixels inside the finger radius chip off only if they already touch
-        // empty space. This keeps the player from erasing holes from the middle.
-        var remove = new List<int>();
-        for (int i = 0; i < hanging.Count; i++)
+        int n = 0;
+        float dash = Mathf.Max(sampleStep, pixel * cutGuideDashPixels);
+        float gap = Mathf.Max(sampleStep, pixel * cutGuideGapPixels);
+        float cycle = dash + gap;
+        for (float d = 0f; d <= len; d += sampleStep)
         {
-            float dx = hanging[i].pos.x - center.x, dy = hanging[i].pos.y - center.y;
-            if (dx * dx + dy * dy <= r2 && IsEdgePixel(hanging[i], occupied)) remove.Add(i);
+            Vector3 pos = cutStart + dir * d;
+            bool overPicture = IsWorldInsideOccupiedPixel(pos, occupied);
+            if (overPicture && Mathf.Repeat(d, cycle) > dash) continue;
+            FillGuideParticle(ref cutBuf[n++], pos, CUT_GUIDE_COLOR);
         }
+
+        cutGuidePS.SetParticles(cutBuf, n);
+    }
+
+    void UpdateCircle(LineRenderer lr, Vector3 center, float radius)
+    {
+        if (lr == null) return;
+
+        const int steps = 32;
+        if (lr.positionCount != steps) lr.positionCount = steps;
+        for (int i = 0; i < steps; i++)
+        {
+            float a = Mathf.PI * 2f * i / steps;
+            lr.SetPosition(i, center + new Vector3(Mathf.Cos(a) * radius, Mathf.Sin(a) * radius, 0f));
+        }
+    }
+
+    void UpdateCut(Vector3 world)
+    {
+        if (!cutting) return;
+        cutCurrent = world;
+        UpdateCutPreview();
+    }
+
+    void EndCut(Vector3 world)
+    {
+        if (!cutting) return;
+        cutCurrent = world;
+        cutting = false;
+        SetCutPreviewVisible(false);
+
+        if ((cutCurrent - cutStart).magnitude >= MIN_SWIPE)
+            Cut(cutStart, cutCurrent);
+    }
+
+    void Cut(Vector3 a, Vector3 b)
+    {
+        if (hanging.Count == 0) return;
+
+        var remove = new List<int>();
+        float halfWidth = Mathf.Max(pixel * 0.18f, eraseRadius * 0.18f);
+        for (int i = 0; i < hanging.Count; i++)
+            if (DistancePointSegment(hanging[i].pos, a, b) <= halfWidth)
+                remove.Add(i);
         if (remove.Count == 0) return;
 
-        var removeSet = new HashSet<int>(remove);
-        float nr2 = eraseRadius * 3f; nr2 *= nr2;   // neighborhood to analyze
-
+        Vector2 cutDir = new Vector2(b.x - a.x, b.y - a.y);
+        if (cutDir.sqrMagnitude < 1e-5f) cutDir = Vector2.right;
+        Vector2 cutNormal = new Vector2(-cutDir.y, cutDir.x).normalized;
         foreach (int idx in remove)
         {
             var p = hanging[idx];
-
-            // repulsion away from nearby pixels that are NOT being destroyed:
-            // each surviving neighbor pushes this pixel outward (inverse-square),
-            // so it flies toward open space, never back into the picture.
-            Vector2 away = Vector2.zero;
-            for (int j = 0; j < hanging.Count; j++)
-            {
-                if (removeSet.Contains(j)) continue;
-                float dx = p.pos.x - hanging[j].pos.x, dy = p.pos.y - hanging[j].pos.y;
-                float d2 = dx * dx + dy * dy;
-                if (d2 > nr2 || d2 < 1e-6f) continue;
-                away += new Vector2(dx, dy) / d2;
-            }
-
-            Vector2 dir;
-            if (away.sqrMagnitude > 1e-5f) dir = away.normalized;
-            else
-            {
-                // fully surrounded (no open side nearby) — fan out from the touch point
-                Vector2 fc = new Vector2(p.pos.x - center.x, p.pos.y - center.y);
-                if (fc.sqrMagnitude > 1e-5f) dir = fc.normalized;
-                else { float a = Random.value * Mathf.PI * 2f; dir = new Vector2(Mathf.Cos(a), Mathf.Sin(a)); }
-            }
-
-            float mag = eraseImpulse * Random.Range(0.7f, 1.1f);
-            float vx = dir.x * mag;
-            float vy = dir.y * mag + eraseImpulse * 0.25f;   // slight upward arc for feel
-            fallers.Add(new Faller { pos = p.pos, vx = vx, vy = vy, col = p.col, pi = p.pi });
+            float side = Mathf.Sign(Vector2.Dot(new Vector2(p.pos.x - a.x, p.pos.y - a.y), cutNormal));
+            if (side == 0f) side = Random.value < 0.5f ? -1f : 1f;
+            ShatterPixel(p, cutNormal * side, eraseImpulse * Random.Range(0.65f, 1.05f));
         }
 
         for (int k = remove.Count - 1; k >= 0; k--) hanging.RemoveAt(remove[k]);
-        DetachSeparatedPieces();
+        DetachSeparatedPieces(true, a, b);
         UploadHanging();
     }
 
-    void DetachSeparatedPieces()
+    void ShatterPixel(Px p, Vector2 dir, float impulse)
+    {
+        if (dir.sqrMagnitude < 1e-5f)
+        {
+            float a = Random.value * Mathf.PI * 2f;
+            dir = new Vector2(Mathf.Cos(a), Mathf.Sin(a));
+        }
+        dir.Normalize();
+        fallers.Add(new Faller
+        {
+            pos = p.pos,
+            vx = dir.x * impulse,
+            vy = dir.y * impulse + eraseImpulse * 0.2f,
+            col = p.col,
+            pi = p.pi
+        });
+    }
+
+    void DetachSeparatedPieces(bool shatterDetached, Vector3 cutA, Vector3 cutB)
     {
         if (hanging.Count <= 1) return;
 
@@ -840,12 +940,38 @@ public class SliceGame : MonoBehaviour
                 pixels.Add(hanging[idx]);
                 detachSet.Add(idx);
             }
-            detachedChunks.Add(new DetachedChunk(pixels));
+
+            if (shatterDetached)
+                ShatterChunk(pixels, cutA, cutB);
+            else
+                detachedChunks.Add(new DetachedChunk(pixels));
         }
 
         for (int i = hanging.Count - 1; i >= 0; i--)
             if (detachSet.Contains(i))
                 hanging.RemoveAt(i);
+    }
+
+    void ShatterChunk(List<Px> pixels, Vector3 cutA, Vector3 cutB)
+    {
+        if (pixels.Count == 0) return;
+
+        Vector2 center = Vector2.zero;
+        foreach (var p in pixels) center += new Vector2(p.pos.x, p.pos.y);
+        center /= pixels.Count;
+
+        Vector2 cutDir = new Vector2(cutB.x - cutA.x, cutB.y - cutA.y);
+        Vector2 cutNormal = cutDir.sqrMagnitude > 1e-5f ? new Vector2(-cutDir.y, cutDir.x).normalized : Vector2.up;
+        float side = Mathf.Sign(Vector2.Dot(center - new Vector2(cutA.x, cutA.y), cutNormal));
+        if (side == 0f) side = 1f;
+        Vector2 baseDir = cutNormal * side;
+
+        foreach (var p in pixels)
+        {
+            Vector2 fromCenter = new Vector2(p.pos.x, p.pos.y) - center;
+            Vector2 dir = (baseDir * 0.85f + fromCenter.normalized * 0.55f).normalized;
+            ShatterPixel(p, dir, eraseImpulse * Random.Range(0.85f, 1.35f));
+        }
     }
 
     int[,] BuildHangingIndexGrid()
@@ -874,6 +1000,28 @@ public class SliceGame : MonoBehaviour
         var occupied = new bool[texW, texH];
         foreach (var p in hanging) occupied[p.x, p.y] = true;
         return occupied;
+    }
+
+    bool IsWorldInsideOccupiedPixel(Vector3 world, bool[,] occupied)
+    {
+        int x = Mathf.RoundToInt(world.x / pixel + (texW - 1) * 0.5f);
+        int y = Mathf.RoundToInt((world.y - pictureCenterY) / pixel + (texH - 1) * 0.5f);
+        if (x < 0 || x >= texW || y < 0 || y >= texH || !occupied[x, y]) return false;
+
+        Vector3 center = PixelToWorld(x, y);
+        return Mathf.Abs(world.x - center.x) <= pixel * 0.5f
+            && Mathf.Abs(world.y - center.y) <= pixel * 0.5f;
+    }
+
+    static float DistancePointSegment(Vector3 p, Vector3 a, Vector3 b)
+    {
+        Vector2 ap = new Vector2(p.x - a.x, p.y - a.y);
+        Vector2 ab = new Vector2(b.x - a.x, b.y - a.y);
+        float ab2 = ab.sqrMagnitude;
+        if (ab2 < 1e-6f) return ap.magnitude;
+        float t = Mathf.Clamp01(Vector2.Dot(ap, ab) / ab2);
+        Vector2 closest = new Vector2(a.x, a.y) + ab * t;
+        return Vector2.Distance(new Vector2(p.x, p.y), closest);
     }
 
     bool IsEdgePixel(Px p, bool[,] occupied)
