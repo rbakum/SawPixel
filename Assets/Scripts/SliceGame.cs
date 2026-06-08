@@ -31,7 +31,7 @@ public class SliceGame : MonoBehaviour
     public float colorMatch = 0.30f;  // max color distance a jar will accept
 
     [Header("Erase")]
-    public float fingerPixels = 4.5f; // erase radius in pixel-widths (finger size)
+    public float fingerPixels = 3.6f; // erase radius in pixel-widths (finger size)
     public float eraseImpulse = 4f;   // how hard chipped pixels fly out
 
     const float ORTHO_SIZE = 5f;
