@@ -413,6 +413,7 @@ MonoBehaviour:
   capacityMin: 50
   capacityMax: 100
   colorMatch: 0.3
+  tubeCapacity: 100
   fingerPixels: 4.5
   eraseImpulse: 4
 --- !u!4 &1379775640

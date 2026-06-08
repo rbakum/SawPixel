@@ -29,6 +29,7 @@ public class SliceGame : MonoBehaviour
     public int capacityMin = 5;
     public int capacityMax = 15;
     public float colorMatch = 0.30f;  // max color distance a jar will accept
+    public int tubeCapacity = 0;      // 0 = auto (fills tube geometry)
 
     [Header("Erase")]
     public float fingerPixels = 3.6f; // erase radius in pixel-widths (finger size)
@@ -174,7 +175,8 @@ public class SliceGame : MonoBehaviour
         previewHalfH = 0.07f * H;
 
         backlogPerRow = Mathf.Max(1, Mathf.FloorToInt(2f * tubeHalfW / pixel));
-        backlogCapacity = backlogPerRow * Mathf.Max(2, Mathf.FloorToInt((tubeTopY - tubeBotY) / pixel));
+        int autoCapacity = backlogPerRow * Mathf.Max(2, Mathf.FloorToInt((tubeTopY - tubeBotY) / pixel));
+        backlogCapacity = tubeCapacity > 0 ? tubeCapacity : autoCapacity;
 
         eraseRadius = pixel * fingerPixels;
     }
