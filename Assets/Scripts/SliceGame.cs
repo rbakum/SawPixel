@@ -39,7 +39,7 @@ public class SliceGame : MonoBehaviour
     const int PALETTE_MAX = 5;
 
     static readonly Color FRAME_COLOR = new Color(0.9f, 0.9f, 0.9f, 1f);
-    static readonly Color BG_COLOR = new Color(0.08f, 0.08f, 0.10f, 1f);
+    static readonly Color BG_COLOR = new Color(0.96f, 0.96f, 0.86f, 1f);
     static readonly Color MACHINE_COLOR = new Color(0.55f, 0.58f, 0.65f, 1f);
 
     struct Px { public Vector3 pos; public Color col; public int pi; public int x, y; }   // pi = palette index
@@ -193,6 +193,10 @@ public class SliceGame : MonoBehaviour
         return GenerateDefault(out w, out h);
     }
 
+    // Read the source 1:1 into a per-pixel color grid. Nearest-neighbour only:
+    // we want crisp pixels, never bilinear blur. Aspect ratio is preserved — the
+    // grid keeps the texture's real width/height; game scaling happens later via
+    // the uniform `pixel` size, not by squashing the grid.
     Color[] ReadViaBlit(Texture2D src, out int w, out int h)
     {
         int sw = src.width, sh = src.height;
@@ -200,7 +204,13 @@ public class SliceGame : MonoBehaviour
         w = Mathf.Max(1, Mathf.RoundToInt(sw * scale));
         h = Mathf.Max(1, Mathf.RoundToInt(sh * scale));
 
+        // force point sampling on the source so the blit can't introduce
+        // half-tone interpolation, regardless of the texture's import filter.
+        var prevFilter = src.filterMode;
+        src.filterMode = FilterMode.Point;
+
         var rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+        rt.filterMode = FilterMode.Point;
         Graphics.Blit(src, rt);
         var prev = RenderTexture.active;
         RenderTexture.active = rt;
@@ -209,6 +219,7 @@ public class SliceGame : MonoBehaviour
         tmp.Apply();
         RenderTexture.active = prev;
         RenderTexture.ReleaseTemporary(rt);
+        src.filterMode = prevFilter;
         var cols = tmp.GetPixels();
         Destroy(tmp);
         return cols;

@@ -319,8 +319,8 @@ Camera:
   m_GameObject: {fileID: 963194225}
   m_Enabled: 1
   serializedVersion: 2
-  m_ClearFlags: 1
-  m_BackGroundColor: {r: 0.19215687, g: 0.3019608, b: 0.4745098, a: 0}
+  m_ClearFlags: 2
+  m_BackGroundColor: {r: 0.9608, g: 0.9608, b: 0.8627, a: 1}
   m_projectionMatrixMode: 1
   m_GateFitMode: 2
   m_FOVAxisMode: 0
@@ -405,14 +405,16 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 22c04d42b805745fab4ae73bf15fe8f4, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  sourceTexture: {fileID: 2800000, guid: 2b02230e1019c4ff0bf872943ef8e381, type: 3}
-  maxResolution: 48
+  sourceTexture: {fileID: 2800000, guid: 70e26bfb59b184c9fb56ecd92971d161, type: 3}
+  maxResolution: 100
   gravity: 16
   funnelSteer: 9
   jarSteer: 13
-  capacityMin: 10
-  capacityMax: 30
+  capacityMin: 50
+  capacityMax: 100
   colorMatch: 0.3
+  fingerPixels: 4.5
+  eraseImpulse: 4
 --- !u!4 &1379775640
 Transform:
   m_ObjectHideFlags: 0
