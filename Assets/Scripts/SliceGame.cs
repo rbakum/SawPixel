@@ -58,6 +58,14 @@ public class SliceGame : MonoBehaviour
         public bool consumed;  // jar completed and ate this pixel; swept out after the loop
     }
 
+    class DetachedChunk
+    {
+        public readonly List<Px> pixels;
+        public float vy;
+
+        public DetachedChunk(List<Px> pixels) { this.pixels = pixels; }
+    }
+
     struct JarDef { public int pi; public Color color; public int capacity; }
 
     class Slot
@@ -74,6 +82,7 @@ public class SliceGame : MonoBehaviour
     ParticleSystem hangingPS, fallingPS;
     readonly List<Px> hanging = new List<Px>();
     readonly List<Faller> fallers = new List<Faller>();
+    readonly List<DetachedChunk> detachedChunks = new List<DetachedChunk>();
     ParticleSystem.Particle[] buf = new ParticleSystem.Particle[256];
 
     Camera cam;
@@ -537,13 +546,19 @@ public class SliceGame : MonoBehaviour
 
     void RenderFallers()
     {
-        EnsureBuf(fallers.Count);
+        int chunkPixels = 0;
+        foreach (var c in detachedChunks) chunkPixels += c.pixels.Count;
+
+        EnsureBuf(fallers.Count + chunkPixels);
         int n = 0;
         foreach (var f in fallers)
         {
             if (f.consumed) continue;
             FillParticle(ref buf[n++], f.pos, f.col);
         }
+        foreach (var c in detachedChunks)
+            foreach (var p in c.pixels)
+                FillParticle(ref buf[n++], p.pos, p.col);
         fallingPS.SetParticles(buf, n);
     }
 
@@ -573,6 +588,8 @@ public class SliceGame : MonoBehaviour
 
     void Simulate(float dt)
     {
+        SimulateDetachedChunks(dt);
+
         foreach (var f in fallers)
         {
             if (f.landed || f.inTube) continue;   // parked pixels are handled in WaitingPass
@@ -605,6 +622,30 @@ public class SliceGame : MonoBehaviour
         }
 
         WaitingPass();
+    }
+
+    void SimulateDetachedChunks(float dt)
+    {
+        for (int i = detachedChunks.Count - 1; i >= 0; i--)
+        {
+            var chunk = detachedChunks[i];
+            chunk.vy -= gravity * dt;
+
+            float bottom = float.MaxValue;
+            for (int p = 0; p < chunk.pixels.Count; p++)
+            {
+                var px = chunk.pixels[p];
+                px.pos.y += chunk.vy * dt;
+                chunk.pixels[p] = px;
+                bottom = Mathf.Min(bottom, px.pos.y - pixel * 0.5f);
+            }
+
+            if (bottom <= funnelTopY)
+            {
+                foreach (var px in chunk.pixels) AddFaller(px, chunk.vy);
+                detachedChunks.RemoveAt(i);
+            }
+        }
     }
 
     // The tube is a buffer: pixels with no matching free jar wait here and are
@@ -732,7 +773,87 @@ public class SliceGame : MonoBehaviour
         }
 
         for (int k = remove.Count - 1; k >= 0; k--) hanging.RemoveAt(remove[k]);
+        DetachSeparatedPieces();
         UploadHanging();
+    }
+
+    void DetachSeparatedPieces()
+    {
+        if (hanging.Count <= 1) return;
+
+        int[,] indexAt = BuildHangingIndexGrid();
+        var visited = new bool[hanging.Count];
+        var components = new List<List<int>>();
+
+        for (int i = 0; i < hanging.Count; i++)
+        {
+            if (visited[i]) continue;
+
+            var component = new List<int>();
+            var q = new Queue<int>();
+            q.Enqueue(i);
+            visited[i] = true;
+
+            while (q.Count > 0)
+            {
+                int idx = q.Dequeue();
+                component.Add(idx);
+                var p = hanging[idx];
+
+                EnqueueNeighbor(p.x - 1, p.y, indexAt, visited, q);
+                EnqueueNeighbor(p.x + 1, p.y, indexAt, visited, q);
+                EnqueueNeighbor(p.x, p.y - 1, indexAt, visited, q);
+                EnqueueNeighbor(p.x, p.y + 1, indexAt, visited, q);
+            }
+
+            components.Add(component);
+        }
+
+        if (components.Count <= 1) return;
+
+        int mainComponent = 0;
+        for (int i = 1; i < components.Count; i++)
+            if (components[i].Count > components[mainComponent].Count)
+                mainComponent = i;
+
+        var detachSet = new HashSet<int>();
+        for (int i = 0; i < components.Count; i++)
+        {
+            if (i == mainComponent) continue;
+
+            var pixels = new List<Px>(components[i].Count);
+            foreach (int idx in components[i])
+            {
+                pixels.Add(hanging[idx]);
+                detachSet.Add(idx);
+            }
+            detachedChunks.Add(new DetachedChunk(pixels));
+        }
+
+        for (int i = hanging.Count - 1; i >= 0; i--)
+            if (detachSet.Contains(i))
+                hanging.RemoveAt(i);
+    }
+
+    int[,] BuildHangingIndexGrid()
+    {
+        var indexAt = new int[texW, texH];
+        for (int y = 0; y < texH; y++)
+            for (int x = 0; x < texW; x++)
+                indexAt[x, y] = -1;
+
+        for (int i = 0; i < hanging.Count; i++)
+            indexAt[hanging[i].x, hanging[i].y] = i;
+        return indexAt;
+    }
+
+    void EnqueueNeighbor(int x, int y, int[,] indexAt, bool[] visited, Queue<int> q)
+    {
+        if (x < 0 || x >= texW || y < 0 || y >= texH) return;
+        int idx = indexAt[x, y];
+        if (idx < 0 || visited[idx]) return;
+        visited[idx] = true;
+        q.Enqueue(idx);
     }
 
     bool[,] BuildHangingGrid()
@@ -763,7 +884,7 @@ public class SliceGame : MonoBehaviour
         return w;
     }
 
-    void AddFaller(Px p) => fallers.Add(new Faller { pos = p.pos, vy = 0f, col = p.col, pi = p.pi });
+    void AddFaller(Px p, float vy = 0f) => fallers.Add(new Faller { pos = p.pos, vy = vy, col = p.col, pi = p.pi });
 
     void ReleaseAll()
     {
