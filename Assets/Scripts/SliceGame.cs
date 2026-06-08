@@ -1,32 +1,38 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-// Iteration 3 — color-sorting machine.
-//   * Picture is built from any texture (per-pixel color), see LoadColors.
-//   * SPACE / tap releases the whole picture; swipe still cuts a chunk off.
-//   * Released pixels fall, funnel into a central tube, then the tube splits
-//     into three channels leading to three jars.
-//   * Jar colors are auto-derived from the texture's dominant colors.
-//     2 distinct colors  -> [c0, c1, c1];  3+ -> top three.
-//   * Each falling pixel is routed to the jar whose color is nearest to it.
-//   * Jars are infinite for now: pixels just stack up bottom-to-top.
-// Pixels are NOT GameObjects. HangingPS renders the intact picture; FallingPS
-// is a pure renderer fed by a tiny hand-written 2D simulation (physics can't
-// sort by color, so the falling/routing is done in script).
+// Iteration 4 — jars with capacity + a queue ("layers") and clog risk.
+//   * Picture is built from any texture (per-pixel color).
+//   * SPACE / two-finger tap releases the whole picture; swipe cuts a chunk.
+//   * Pixels funnel into a central tube, then route to one of three ACTIVE jars
+//     by nearest color (only if that jar still has capacity).
+//   * Each jar has a random small capacity and a random color drawn from the
+//     texture palette. A number on the jar shows how many pixels it still needs.
+//   * When a jar is full its pixels are consumed and the next jar from the queue
+//     slides into that slot. The next layer (3 upcoming jars) is shown as a
+//     preview row with their colors and numbers.
+//   * A pixel with no matching active jar piles up in the tube. If the tube
+//     fills to the top it CLOGS — the fail state the player must avoid.
+// Pixels are NOT GameObjects; ParticleSystem is used purely as a batch renderer
+// fed by a small hand-written 2D simulation.
 [DisallowMultipleComponent]
 public class SliceGame : MonoBehaviour
 {
     [Header("Source")]
     public Texture2D sourceTexture;   // assign any texture; null => generated default
-    public int maxResolution = 48;    // cap on the longest side when sampling
+    public int maxResolution = 48;
 
     [Header("Tuning")]
     public float gravity = 16f;
-    public float funnelSteer = 9f;    // horizontal pull toward the tube
-    public float jarSteer = 13f;      // horizontal pull toward the target jar
+    public float funnelSteer = 9f;
+    public float jarSteer = 13f;
+    public int capacityMin = 5;
+    public int capacityMax = 15;
+    public float colorMatch = 0.30f;  // max color distance a jar will accept
 
     const float ORTHO_SIZE = 5f;
     const float MIN_SWIPE = 0.2f;
+    const int PALETTE_MAX = 5;
 
     static readonly Color FRAME_COLOR = new Color(0.9f, 0.9f, 0.9f, 1f);
     static readonly Color BG_COLOR = new Color(0.08f, 0.08f, 0.10f, 1f);
@@ -39,9 +45,23 @@ public class SliceGame : MonoBehaviour
         public Vector3 pos;
         public float vy;
         public Color col;
-        public int jar;
-        public bool sorted;
+        public int jar;        // 0..2 active jar
+        public bool routed;    // has passed the tube entry decision point
+        public bool inTube;    // parked in the tube buffer, waiting for a free jar
         public bool landed;
+        public bool consumed;  // jar completed and ate this pixel; swept out after the loop
+    }
+
+    struct JarDef { public Color color; public int capacity; }
+
+    class Slot
+    {
+        public Color color;
+        public int capacity;
+        public int reserved;   // assigned (in-flight + landed)
+        public int landed;     // settled in the jar
+        public LineRenderer box;
+        public TextMesh text;
     }
 
     ParticleSystem hangingPS, fallingPS;
@@ -50,17 +70,23 @@ public class SliceGame : MonoBehaviour
     ParticleSystem.Particle[] buf = new ParticleSystem.Particle[256];
 
     Camera cam;
-    float W, H;            // frame half width / height
-    float pixel;
+    float W, H, pixel;
     int texW, texH;
 
-    // machine layout (world Y / X)
-    float funnelTopY, tubeTopY, tubeBotY, jarTopY, jarBottomY, pictureCenterY;
-    float tubeHalfW, funnelHalfW, jarInnerHalfW;
+    float funnelTopY, tubeTopY, tubeBotY, jarTopY, jarBottomY, pictureCenterY, previewY;
+    float tubeHalfW, funnelHalfW, jarInnerHalfW, previewHalfW, previewHalfH;
     readonly float[] jarCenterX = new float[3];
-    readonly Color[] jarColor = new Color[3];
-    readonly int[] jarCount = new int[3];
-    int jarPerRow;
+    int jarPerRow, backlogPerRow, backlogCapacity;
+
+    readonly List<Color> palette = new List<Color>();
+    readonly Slot[] slots = new Slot[3];
+    readonly Queue<JarDef> queue = new Queue<JarDef>();
+    LineRenderer[] previewBox = new LineRenderer[3];
+    TextMesh[] previewText = new TextMesh[3];
+
+    bool clogged;
+    TextMesh statusText;
+    Font uiFont;
 
     bool dragging;
     Vector3 downPos;
@@ -71,11 +97,13 @@ public class SliceGame : MonoBehaviour
         ComputeFrameBounds();
         var cols = LoadColors(out texW, out texH);
         ComputeLayout();
+        LoadFont();
         BuildFrameVisual();
         BuildParticleSystems();
         BuildPicture(cols);
         ExtractPalette();
         BuildMachineVisual();
+        BuildJarsAndQueue();
         UploadHanging();
     }
 
@@ -107,24 +135,36 @@ public class SliceGame : MonoBehaviour
     void ComputeLayout()
     {
         funnelTopY = 0.35f * H;
-        tubeTopY = 0.12f * H;
-        tubeBotY = -0.05f * H;
-        jarTopY = -0.28f * H;
-        jarBottomY = -0.92f * H;
+        tubeTopY = 0.14f * H;
+        tubeBotY = -0.04f * H;
+        jarTopY = -0.20f * H;
+        jarBottomY = -0.66f * H;
+        previewY = -0.84f * H;
         pictureCenterY = 0.62f * H;
 
-        // fit picture into the zone above the funnel
         float zoneH = 0.55f * H;
         float zoneW = 1.6f * W;
         pixel = Mathf.Min(zoneH / Mathf.Max(1, texH), zoneW / Mathf.Max(1, texW));
 
-        tubeHalfW = Mathf.Max(pixel * 1.5f, 0.05f * W);
+        tubeHalfW = Mathf.Max(pixel * 3f, 0.08f * W);
         funnelHalfW = 0.45f * W;
         jarInnerHalfW = 0.26f * W;
         jarCenterX[0] = -0.58f * W;
         jarCenterX[1] = 0f;
         jarCenterX[2] = 0.58f * W;
         jarPerRow = Mathf.Max(1, Mathf.FloorToInt(2f * jarInnerHalfW / pixel));
+
+        previewHalfW = 0.14f * W;
+        previewHalfH = 0.07f * H;
+
+        backlogPerRow = Mathf.Max(1, Mathf.FloorToInt(2f * tubeHalfW / pixel));
+        backlogCapacity = backlogPerRow * Mathf.Max(2, Mathf.FloorToInt((tubeTopY - tubeBotY) / pixel));
+    }
+
+    void LoadFont()
+    {
+        uiFont = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        if (uiFont == null) uiFont = Resources.GetBuiltinResource<Font>("Arial.ttf");
     }
 
     // ---- texture loading ------------------------------------------------
@@ -151,7 +191,7 @@ public class SliceGame : MonoBehaviour
         tmp.Apply();
         RenderTexture.active = prev;
         RenderTexture.ReleaseTemporary(rt);
-        var cols = tmp.GetPixels();   // bottom-to-top rows
+        var cols = tmp.GetPixels();
         Destroy(tmp);
         return cols;
     }
@@ -193,7 +233,7 @@ public class SliceGame : MonoBehaviour
 
     void ExtractPalette()
     {
-        var sum = new Dictionary<int, Vector4>();   // key -> (r,g,b, count)
+        var sum = new Dictionary<int, Vector4>();
         foreach (var p in hanging)
         {
             int key = Quant(p.col);
@@ -201,18 +241,16 @@ public class SliceGame : MonoBehaviour
             v.x += p.col.r; v.y += p.col.g; v.z += p.col.b; v.w += 1f;
             sum[key] = v;
         }
-
         var list = new List<Vector4>(sum.Values);
-        list.Sort((a, b) => b.w.CompareTo(a.w));   // by count desc
+        list.Sort((a, b) => b.w.CompareTo(a.w));
 
-        var reps = new List<Color>();
+        palette.Clear();
         foreach (var v in list)
-            reps.Add(new Color(v.x / v.w, v.y / v.w, v.z / v.w, 1f));
-
-        if (reps.Count == 0) { reps.Add(Color.red); reps.Add(Color.green); reps.Add(Color.blue); }
-        while (reps.Count < 3) reps.Add(reps[reps.Count - 1]);   // 2 colors -> [c0,c1,c1]
-
-        for (int i = 0; i < 3; i++) jarColor[i] = reps[i];
+        {
+            if (palette.Count >= PALETTE_MAX) break;
+            palette.Add(new Color(v.x / v.w, v.y / v.w, v.z / v.w, 1f));
+        }
+        if (palette.Count == 0) { palette.Add(Color.red); palette.Add(Color.green); palette.Add(Color.blue); }
     }
 
     static int Quant(Color c)
@@ -223,13 +261,107 @@ public class SliceGame : MonoBehaviour
         return (r * 5 + g) * 5 + b;
     }
 
-    int NearestJar(Color c)
+    static float ColorDist2(Color a, Color b)
     {
-        int best = 0; float bd = float.MaxValue;
+        float dr = a.r - b.r, dg = a.g - b.g, db = a.b - b.b;
+        return dr * dr + dg * dg + db * db;
+    }
+
+    JarDef RandomJar()
+    {
+        return new JarDef
+        {
+            color = palette[Random.Range(0, palette.Count)],
+            capacity = Random.Range(capacityMin, capacityMax + 1)
+        };
+    }
+
+    // ---- jars & queue ---------------------------------------------------
+
+    void BuildJarsAndQueue()
+    {
+        for (int i = 0; i < 6; i++) queue.Enqueue(RandomJar());
+
         for (int i = 0; i < 3; i++)
         {
-            float dr = c.r - jarColor[i].r, dg = c.g - jarColor[i].g, db = c.b - jarColor[i].b;
-            float d = dr * dr + dg * dg + db * db;
+            var s = new Slot();
+            float l = jarCenterX[i] - jarInnerHalfW, r = jarCenterX[i] + jarInnerHalfW;
+            s.box = MakeLine("Jar" + i, Color.white, 0.05f, false,
+                new Vector3(l, jarTopY, 0), new Vector3(l, jarBottomY, 0),
+                new Vector3(r, jarBottomY, 0), new Vector3(r, jarTopY, 0));
+            s.text = MakeText("JarNum" + i, new Vector3(jarCenterX[i], jarTopY - 0.07f * H, 0), 0.32f, Color.white);
+            slots[i] = s;
+            FillSlot(i, queue.Dequeue());
+        }
+
+        for (int i = 0; i < 3; i++)
+        {
+            float cx = jarCenterX[i];
+            previewBox[i] = MakeLine("PrevBox" + i, Color.white, 0.035f, true,
+                new Vector3(cx - previewHalfW, previewY - previewHalfH, 0),
+                new Vector3(cx + previewHalfW, previewY - previewHalfH, 0),
+                new Vector3(cx + previewHalfW, previewY + previewHalfH, 0),
+                new Vector3(cx - previewHalfW, previewY + previewHalfH, 0));
+            previewText[i] = MakeText("PrevNum" + i, new Vector3(cx, previewY, 0), 0.22f, Color.white);
+        }
+        RefreshPreview();
+
+        statusText = MakeText("Status", new Vector3(0, 0.93f * H, 0), 0.4f, new Color(1f, 0.4f, 0.4f));
+        statusText.text = "";
+    }
+
+    void FillSlot(int i, JarDef def)
+    {
+        var s = slots[i];
+        s.color = def.color;
+        s.capacity = def.capacity;
+        s.reserved = 0;
+        s.landed = 0;
+        s.box.startColor = s.box.endColor = def.color;
+        UpdateSlotText(i);
+    }
+
+    void UpdateSlotText(int i)
+    {
+        var s = slots[i];
+        s.text.text = (s.capacity - s.landed).ToString();
+        s.text.color = s.color;
+    }
+
+    void CompleteSlot(int i)
+    {
+        // mark the jar's pixels as eaten (don't mutate the list mid-simulation;
+        // they are swept out at the end of Update)
+        foreach (var f in fallers)
+            if (f.landed && f.jar == i) f.consumed = true;
+        sweepConsumed = true;
+        if (queue.Count < 6) queue.Enqueue(RandomJar());
+        FillSlot(i, queue.Dequeue());
+        RefreshPreview();
+    }
+
+    void RefreshPreview()
+    {
+        var arr = queue.ToArray();
+        for (int i = 0; i < 3; i++)
+        {
+            if (i < arr.Length)
+            {
+                previewBox[i].startColor = previewBox[i].endColor = arr[i].color;
+                previewText[i].text = arr[i].capacity.ToString();
+                previewText[i].color = arr[i].color;
+            }
+            else { previewText[i].text = ""; }
+        }
+    }
+
+    int ChooseJar(Color c)
+    {
+        int best = -1; float bd = colorMatch * colorMatch;
+        for (int i = 0; i < 3; i++)
+        {
+            if (slots[i].reserved >= slots[i].capacity) continue;
+            float d = ColorDist2(c, slots[i].color);
             if (d < bd) { bd = d; best = i; }
         }
         return best;
@@ -239,35 +371,26 @@ public class SliceGame : MonoBehaviour
 
     void BuildFrameVisual()
     {
-        Line("FrameVisual", FRAME_COLOR, 0.05f, true,
+        MakeLine("FrameVisual", FRAME_COLOR, 0.05f, true,
             new Vector3(-W, -H, 0), new Vector3(W, -H, 0), new Vector3(W, H, 0), new Vector3(-W, H, 0));
     }
 
     void BuildMachineVisual()
     {
-        // funnel
-        Line("FunnelL", MACHINE_COLOR, 0.04f, false,
+        MakeLine("FunnelL", MACHINE_COLOR, 0.04f, false,
             new Vector3(-funnelHalfW, funnelTopY, 0), new Vector3(-tubeHalfW, tubeTopY, 0));
-        Line("FunnelR", MACHINE_COLOR, 0.04f, false,
+        MakeLine("FunnelR", MACHINE_COLOR, 0.04f, false,
             new Vector3(funnelHalfW, funnelTopY, 0), new Vector3(tubeHalfW, tubeTopY, 0));
-        // tube
-        Line("TubeL", MACHINE_COLOR, 0.04f, false,
+        MakeLine("TubeL", MACHINE_COLOR, 0.04f, false,
             new Vector3(-tubeHalfW, tubeTopY, 0), new Vector3(-tubeHalfW, tubeBotY, 0));
-        Line("TubeR", MACHINE_COLOR, 0.04f, false,
+        MakeLine("TubeR", MACHINE_COLOR, 0.04f, false,
             new Vector3(tubeHalfW, tubeTopY, 0), new Vector3(tubeHalfW, tubeBotY, 0));
-        // 3-way split + jars
         for (int i = 0; i < 3; i++)
-        {
-            Line("Split" + i, MACHINE_COLOR, 0.04f, false,
+            MakeLine("Split" + i, MACHINE_COLOR, 0.04f, false,
                 new Vector3(0, tubeBotY, 0), new Vector3(jarCenterX[i], jarTopY, 0));
-            float l = jarCenterX[i] - jarInnerHalfW, r = jarCenterX[i] + jarInnerHalfW;
-            Line("Jar" + i, jarColor[i], 0.05f, false,
-                new Vector3(l, jarTopY, 0), new Vector3(l, jarBottomY, 0),
-                new Vector3(r, jarBottomY, 0), new Vector3(r, jarTopY, 0));
-        }
     }
 
-    void Line(string name, Color c, float width, bool loop, params Vector3[] pts)
+    LineRenderer MakeLine(string name, Color c, float width, bool loop, params Vector3[] pts)
     {
         var go = new GameObject(name);
         go.transform.SetParent(transform, false);
@@ -280,6 +403,24 @@ public class SliceGame : MonoBehaviour
         lr.startColor = lr.endColor = c;
         lr.positionCount = pts.Length;
         lr.SetPositions(pts);
+        return lr;
+    }
+
+    TextMesh MakeText(string name, Vector3 pos, float worldHeight, Color c)
+    {
+        var go = new GameObject(name);
+        go.transform.SetParent(transform, false);
+        go.transform.position = pos;
+        var tm = go.AddComponent<TextMesh>();
+        tm.font = uiFont;
+        tm.GetComponent<MeshRenderer>().sharedMaterial = uiFont.material;
+        tm.anchor = TextAnchor.MiddleCenter;
+        tm.alignment = TextAlignment.Center;
+        tm.fontSize = 64;
+        tm.color = c;
+        // characterSize tuned so one line ≈ worldHeight units tall
+        tm.characterSize = worldHeight * 0.16f;
+        return tm;
     }
 
     // ---- particle systems ----------------------------------------------
@@ -331,10 +472,14 @@ public class SliceGame : MonoBehaviour
 
     void RenderFallers()
     {
-        int n = fallers.Count;
-        EnsureBuf(n);
-        for (int i = 0; i < n; i++) FillParticle(ref buf[i], fallers[i].pos, fallers[i].col);
-        fallingPS.SetParticles(buf, Mathf.Max(0, n));
+        EnsureBuf(fallers.Count);
+        int n = 0;
+        foreach (var f in fallers)
+        {
+            if (f.consumed) continue;
+            FillParticle(ref buf[n++], f.pos, f.col);
+        }
+        fallingPS.SetParticles(buf, n);
     }
 
     void EnsureBuf(int n) { if (buf.Length < Mathf.Max(1, n)) buf = new ParticleSystem.Particle[Mathf.Max(1, n)]; }
@@ -356,57 +501,91 @@ public class SliceGame : MonoBehaviour
         HandleInput();
         Simulate(Time.deltaTime);
         RenderFallers();
+        if (sweepConsumed) { fallers.RemoveAll(f => f.consumed); sweepConsumed = false; }
     }
+
+    bool sweepConsumed;
 
     void Simulate(float dt)
     {
-        bool any = false;
         foreach (var f in fallers)
         {
-            if (f.landed) continue;
-            any = true;
+            if (f.landed || f.inTube) continue;   // parked pixels are handled in WaitingPass
 
             f.vy -= gravity * dt;
             f.pos.y += f.vy * dt;
 
-            if (!f.sorted)
+            if (!f.routed)
             {
-                if (f.pos.y <= tubeTopY) { f.sorted = true; f.jar = NearestJar(f.col); }
+                if (f.pos.y <= tubeTopY)
+                {
+                    f.routed = true;
+                    int j = ChooseJar(f.col);
+                    if (j >= 0) { f.jar = j; slots[j].reserved++; }
+                    else f.inTube = true;          // no jar right now — wait in the tube
+                }
                 else if (f.pos.y <= funnelTopY)
                     f.pos.x = Mathf.MoveTowards(f.pos.x, 0f, funnelSteer * dt);
             }
 
-            if (f.sorted)
-            {
-                float tx = jarCenterX[f.jar];
-                f.pos.x = Mathf.MoveTowards(f.pos.x, tx, jarSteer * dt);
-                bool aligned = Mathf.Abs(f.pos.x - tx) < pixel * 0.5f;
-
-                int rows = jarCount[f.jar] / jarPerRow;
-                float landY = jarBottomY + (rows + 0.5f) * pixel;
-
-                if (!aligned && f.pos.y < jarTopY)
-                    f.pos.y = jarTopY;                 // wait at the jar mouth until lined up
-                else if (aligned && f.pos.y <= landY)
-                    Land(f);
-            }
+            if (f.routed && f.jar >= 0) StepIntoJar(f, dt);
         }
-        // keep FallingPS alive so SetParticles renders even when nothing moves
-        if (!any && fallers.Count > 0) { /* still rendered each frame */ }
+
+        WaitingPass();
     }
 
-    void Land(Faller f)
+    // The tube is a buffer: pixels with no matching free jar wait here and are
+    // re-checked every frame. When a suitable jar opens up (a jar completes and
+    // the next one slides in), the oldest waiting pixel of that color drains into
+    // it. The tube only CLOGs if more pixels are waiting than it can hold.
+    void WaitingPass()
     {
-        int idx = jarCount[f.jar]++;
-        int row = idx / jarPerRow;
-        int col = idx % jarPerRow;
-        float x0 = jarCenterX[f.jar] - jarInnerHalfW + pixel * 0.5f;
-        f.pos = new Vector3(x0 + col * pixel, jarBottomY + (row + 0.5f) * pixel, 0f);
-        f.vy = 0f;
-        f.landed = true;
+        // drain: oldest-first, so FIFO within a color
+        foreach (var f in fallers)
+        {
+            if (f.landed || !f.inTube) continue;
+            int j = ChooseJar(f.col);
+            if (j >= 0) { f.jar = j; slots[j].reserved++; f.inTube = false; f.vy = 0f; }
+        }
+        // restack whoever is still waiting, bottom-up inside the tube
+        int k = 0;
+        float x0 = -tubeHalfW + pixel * 0.5f;
+        foreach (var f in fallers)
+        {
+            if (f.landed || !f.inTube) continue;
+            int row = k / backlogPerRow, col = k % backlogPerRow;
+            f.pos = new Vector3(x0 + col * pixel, tubeBotY + (row + 0.5f) * pixel, 0f);
+            f.vy = 0f;
+            k++;
+        }
+        clogged = k > backlogCapacity;
+        statusText.text = clogged ? "CLOG!" : "";
     }
 
-    // ---- input & release ------------------------------------------------
+    void StepIntoJar(Faller f, float dt)
+    {
+        float tx = jarCenterX[f.jar];
+        f.pos.x = Mathf.MoveTowards(f.pos.x, tx, jarSteer * dt);
+        bool aligned = Mathf.Abs(f.pos.x - tx) < pixel * 0.5f;
+
+        int rows = slots[f.jar].landed / jarPerRow;
+        float landY = jarBottomY + (rows + 0.5f) * pixel;
+
+        if (!aligned && f.pos.y < jarTopY) f.pos.y = jarTopY;
+        else if (aligned && f.pos.y <= landY)
+        {
+            var s = slots[f.jar];
+            int idx = s.landed++;
+            int row = idx / jarPerRow, col = idx % jarPerRow;
+            float x0 = jarCenterX[f.jar] - jarInnerHalfW + pixel * 0.5f;
+            f.pos = new Vector3(x0 + col * pixel, jarBottomY + (row + 0.5f) * pixel, 0f);
+            f.vy = 0f; f.landed = true;
+            UpdateSlotText(f.jar);
+            if (s.landed >= s.capacity) CompleteSlot(f.jar);
+        }
+    }
+
+    // ---- input ----------------------------------------------------------
 
     void HandleInput()
     {
