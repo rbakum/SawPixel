@@ -42,7 +42,7 @@ public class SliceGame : MonoBehaviour
     static readonly Color BG_COLOR = new Color(0.08f, 0.08f, 0.10f, 1f);
     static readonly Color MACHINE_COLOR = new Color(0.55f, 0.58f, 0.65f, 1f);
 
-    struct Px { public Vector3 pos; public Color col; public int pi; }   // pi = palette index
+    struct Px { public Vector3 pos; public Color col; public int pi; public int x, y; }   // pi = palette index
 
     class Faller
     {
@@ -227,7 +227,7 @@ public class SliceGame : MonoBehaviour
                 Color col = cols[y * texW + x];
                 if (col.a < 0.5f) continue;
                 col.a = 1f;
-                hanging.Add(new Px { pos = PixelToWorld(x, y), col = col });
+                hanging.Add(new Px { pos = PixelToWorld(x, y), col = col, x = x, y = y });
             }
     }
 
@@ -683,12 +683,15 @@ public class SliceGame : MonoBehaviour
         if (hanging.Count == 0) return;
         float r2 = eraseRadius * eraseRadius;
 
-        // pixels inside the finger radius are the ones chipping off this frame
+        bool[,] occupied = BuildHangingGrid();
+
+        // pixels inside the finger radius chip off only if they already touch
+        // empty space. This keeps the player from erasing holes from the middle.
         var remove = new List<int>();
         for (int i = 0; i < hanging.Count; i++)
         {
             float dx = hanging[i].pos.x - center.x, dy = hanging[i].pos.y - center.y;
-            if (dx * dx + dy * dy <= r2) remove.Add(i);
+            if (dx * dx + dy * dy <= r2 && IsEdgePixel(hanging[i], occupied)) remove.Add(i);
         }
         if (remove.Count == 0) return;
 
@@ -730,6 +733,26 @@ public class SliceGame : MonoBehaviour
 
         for (int k = remove.Count - 1; k >= 0; k--) hanging.RemoveAt(remove[k]);
         UploadHanging();
+    }
+
+    bool[,] BuildHangingGrid()
+    {
+        var occupied = new bool[texW, texH];
+        foreach (var p in hanging) occupied[p.x, p.y] = true;
+        return occupied;
+    }
+
+    bool IsEdgePixel(Px p, bool[,] occupied)
+    {
+        return IsEmptyNeighbor(p.x - 1, p.y, occupied)
+            || IsEmptyNeighbor(p.x + 1, p.y, occupied)
+            || IsEmptyNeighbor(p.x, p.y - 1, occupied)
+            || IsEmptyNeighbor(p.x, p.y + 1, occupied);
+    }
+
+    bool IsEmptyNeighbor(int x, int y, bool[,] occupied)
+    {
+        return x < 0 || x >= texW || y < 0 || y >= texH || !occupied[x, y];
     }
 
     Vector3 ScreenToWorld(Vector3 screen)
