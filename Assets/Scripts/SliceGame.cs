@@ -38,13 +38,14 @@ public class SliceGame : MonoBehaviour
     static readonly Color BG_COLOR = new Color(0.08f, 0.08f, 0.10f, 1f);
     static readonly Color MACHINE_COLOR = new Color(0.55f, 0.58f, 0.65f, 1f);
 
-    struct Px { public Vector3 pos; public Color col; }
+    struct Px { public Vector3 pos; public Color col; public int pi; }   // pi = palette index
 
     class Faller
     {
         public Vector3 pos;
         public float vy;
         public Color col;
+        public int pi;         // palette index this pixel belongs to
         public int jar;        // 0..2 active jar
         public bool routed;    // has passed the tube entry decision point
         public bool inTube;    // parked in the tube buffer, waiting for a free jar
@@ -52,10 +53,11 @@ public class SliceGame : MonoBehaviour
         public bool consumed;  // jar completed and ate this pixel; swept out after the loop
     }
 
-    struct JarDef { public Color color; public int capacity; }
+    struct JarDef { public int pi; public Color color; public int capacity; }
 
     class Slot
     {
+        public int pi;         // palette index this jar accepts (-1 = empty/inactive)
         public Color color;
         public int capacity;
         public int reserved;   // assigned (in-flight + landed)
@@ -79,6 +81,7 @@ public class SliceGame : MonoBehaviour
     int jarPerRow, backlogPerRow, backlogCapacity;
 
     readonly List<Color> palette = new List<Color>();
+    int[] paletteCount;
     readonly Slot[] slots = new Slot[3];
     readonly Queue<JarDef> queue = new Queue<JarDef>();
     LineRenderer[] previewBox = new LineRenderer[3];
@@ -102,6 +105,7 @@ public class SliceGame : MonoBehaviour
         BuildParticleSystems();
         BuildPicture(cols);
         ExtractPalette();
+        AssignPaletteIndices();
         BuildMachineVisual();
         BuildJarsAndQueue();
         UploadHanging();
@@ -267,20 +271,61 @@ public class SliceGame : MonoBehaviour
         return dr * dr + dg * dg + db * db;
     }
 
-    JarDef RandomJar()
+    int NearestPaletteIndex(Color c)
     {
-        return new JarDef
+        int best = 0; float bd = float.MaxValue;
+        for (int i = 0; i < palette.Count; i++)
         {
-            color = palette[Random.Range(0, palette.Count)],
-            capacity = Random.Range(capacityMin, capacityMax + 1)
-        };
+            float d = ColorDist2(c, palette[i]);
+            if (d < bd) { bd = d; best = i; }
+        }
+        return best;
+    }
+
+    // Tag every pixel with its palette index and tally how many pixels each color has.
+    void AssignPaletteIndices()
+    {
+        paletteCount = new int[palette.Count];
+        for (int i = 0; i < hanging.Count; i++)
+        {
+            var p = hanging[i];
+            p.pi = NearestPaletteIndex(p.col);
+            hanging[i] = p;
+            paletteCount[p.pi]++;
+        }
+    }
+
+    // Build the full finite jar sequence up front: for each color, its jars'
+    // capacities sum to EXACTLY the number of pixels of that color. So a jar can
+    // never ask for a color/amount that doesn't exist. Order is then shuffled.
+    List<JarDef> BuildSequence()
+    {
+        var defs = new List<JarDef>();
+        for (int pi = 0; pi < palette.Count; pi++)
+        {
+            int rem = paletteCount[pi];
+            while (rem > 0)
+            {
+                int cap = rem <= capacityMax ? rem : Random.Range(capacityMin, capacityMax + 1);
+                cap = Mathf.Min(cap, rem);
+                defs.Add(new JarDef { pi = pi, color = palette[pi], capacity = cap });
+                rem -= cap;
+            }
+        }
+        // Fisher–Yates shuffle
+        for (int i = defs.Count - 1; i > 0; i--)
+        {
+            int j = Random.Range(0, i + 1);
+            (defs[i], defs[j]) = (defs[j], defs[i]);
+        }
+        return defs;
     }
 
     // ---- jars & queue ---------------------------------------------------
 
     void BuildJarsAndQueue()
     {
-        for (int i = 0; i < 6; i++) queue.Enqueue(RandomJar());
+        foreach (var def in BuildSequence()) queue.Enqueue(def);
 
         for (int i = 0; i < 3; i++)
         {
@@ -291,7 +336,8 @@ public class SliceGame : MonoBehaviour
                 new Vector3(r, jarBottomY, 0), new Vector3(r, jarTopY, 0));
             s.text = MakeText("JarNum" + i, new Vector3(jarCenterX[i], jarTopY - 0.07f * H, 0), 0.32f, Color.white);
             slots[i] = s;
-            FillSlot(i, queue.Dequeue());
+            if (queue.Count > 0) FillSlot(i, queue.Dequeue());
+            else EmptySlot(i);
         }
 
         for (int i = 0; i < 3; i++)
@@ -313,17 +359,31 @@ public class SliceGame : MonoBehaviour
     void FillSlot(int i, JarDef def)
     {
         var s = slots[i];
+        s.pi = def.pi;
         s.color = def.color;
         s.capacity = def.capacity;
         s.reserved = 0;
         s.landed = 0;
+        s.box.enabled = true;
         s.box.startColor = s.box.endColor = def.color;
         UpdateSlotText(i);
+    }
+
+    void EmptySlot(int i)
+    {
+        var s = slots[i];
+        s.pi = -1;
+        s.capacity = 0;
+        s.reserved = 0;
+        s.landed = 0;
+        s.box.enabled = false;     // no more jars for this slot
+        s.text.text = "";
     }
 
     void UpdateSlotText(int i)
     {
         var s = slots[i];
+        if (s.pi < 0) { s.text.text = ""; return; }
         s.text.text = (s.capacity - s.landed).ToString();
         s.text.color = s.color;
     }
@@ -335,8 +395,8 @@ public class SliceGame : MonoBehaviour
         foreach (var f in fallers)
             if (f.landed && f.jar == i) f.consumed = true;
         sweepConsumed = true;
-        if (queue.Count < 6) queue.Enqueue(RandomJar());
-        FillSlot(i, queue.Dequeue());
+        if (queue.Count > 0) FillSlot(i, queue.Dequeue());
+        else EmptySlot(i);          // finite sequence: nothing left for this slot
         RefreshPreview();
     }
 
@@ -347,24 +407,24 @@ public class SliceGame : MonoBehaviour
         {
             if (i < arr.Length)
             {
+                previewBox[i].enabled = true;
                 previewBox[i].startColor = previewBox[i].endColor = arr[i].color;
                 previewText[i].text = arr[i].capacity.ToString();
                 previewText[i].color = arr[i].color;
             }
-            else { previewText[i].text = ""; }
+            else { previewBox[i].enabled = false; previewText[i].text = ""; }
         }
     }
 
-    int ChooseJar(Color c)
+    // Route strictly by palette index: a pixel only goes to a jar of its own
+    // color that still has room. No threshold guessing — guarantees the totals
+    // (jar capacities == pixel counts) stay consistent.
+    int ChooseJar(int pi)
     {
-        int best = -1; float bd = colorMatch * colorMatch;
         for (int i = 0; i < 3; i++)
-        {
-            if (slots[i].reserved >= slots[i].capacity) continue;
-            float d = ColorDist2(c, slots[i].color);
-            if (d < bd) { bd = d; best = i; }
-        }
-        return best;
+            if (slots[i].pi == pi && slots[i].reserved < slots[i].capacity)
+                return i;
+        return -1;
     }
 
     // ---- visuals --------------------------------------------------------
@@ -520,7 +580,7 @@ public class SliceGame : MonoBehaviour
                 if (f.pos.y <= tubeTopY)
                 {
                     f.routed = true;
-                    int j = ChooseJar(f.col);
+                    int j = ChooseJar(f.pi);
                     if (j >= 0) { f.jar = j; slots[j].reserved++; }
                     else f.inTube = true;          // no jar right now — wait in the tube
                 }
@@ -544,7 +604,7 @@ public class SliceGame : MonoBehaviour
         foreach (var f in fallers)
         {
             if (f.landed || !f.inTube) continue;
-            int j = ChooseJar(f.col);
+            int j = ChooseJar(f.pi);
             if (j >= 0) { f.jar = j; slots[j].reserved++; f.inTube = false; f.vy = 0f; }
         }
         // restack whoever is still waiting, bottom-up inside the tube
@@ -620,7 +680,7 @@ public class SliceGame : MonoBehaviour
         return w;
     }
 
-    void AddFaller(Px p) => fallers.Add(new Faller { pos = p.pos, vy = 0f, col = p.col });
+    void AddFaller(Px p) => fallers.Add(new Faller { pos = p.pos, vy = 0f, col = p.col, pi = p.pi });
 
     void ReleaseAll()
     {
