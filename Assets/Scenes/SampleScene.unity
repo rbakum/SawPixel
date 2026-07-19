@@ -405,8 +405,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 22c04d42b805745fab4ae73bf15fe8f4, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  sourceTexture: {fileID: 2800000, guid: 70e26bfb59b184c9fb56ecd92971d161, type: 3}
+  sourceTexture: {fileID: 2800000, guid: 7567a9296be4b4f77aa096031c5b213b, type: 3}
   maxResolution: 100
+  useFixedSeed: 0
+  seed: 1949863276
   gravity: 16
   funnelSteer: 9
   jarSteer: 13

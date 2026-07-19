@@ -22,6 +22,10 @@ public class SliceGame : MonoBehaviour
     public Texture2D sourceTexture;   // assign any texture; null => generated default
     public int maxResolution = 48;
 
+    [Header("Seed")]
+    public bool useFixedSeed = false; // if true, the level is built from `seed` every run
+    public int seed = 0;              // the fixed seed to use when useFixedSeed is on
+
     [Header("Tuning")]
     public float gravity = 16f;
     public float funnelSteer = 9f;
@@ -118,7 +122,26 @@ public class SliceGame : MonoBehaviour
     TextMesh statusText;
     Font uiFont;
 
+    int activeSeed;                   // the seed the current level was actually built with
+    GUIStyle seedLabelStyle, seedBtnStyle;
+
+    public int CurrentSeed => activeSeed;
+
     void Start()
+    {
+        InitSeed();
+        Build();
+    }
+
+    // Pick the seed for this run and lock Unity's RNG to it, so the whole level
+    // generation (jar capacities + shuffle) is fully reproducible.
+    void InitSeed()
+    {
+        activeSeed = useFixedSeed ? seed : new System.Random().Next();
+        Random.InitState(activeSeed);
+    }
+
+    void Build()
     {
         SetupCamera();
         ComputeFrameBounds();
@@ -134,6 +157,53 @@ public class SliceGame : MonoBehaviour
         BuildJarsAndQueue();
         BuildCutPreviewVisual();
         UploadHanging();
+    }
+
+    // Restart the level from scratch. Pass a seed to force it; omit to roll a new
+    // random one. Tears the spawned visuals down and rebuilds in place (no scene
+    // reload), so it works while playing.
+    public void Restart(int? withSeed = null)
+    {
+        if (withSeed.HasValue) { useFixedSeed = true; seed = withSeed.Value; }
+        Teardown();
+        InitSeed();
+        Build();
+    }
+
+    void Teardown()
+    {
+        for (int i = transform.childCount - 1; i >= 0; i--)
+            Destroy(transform.GetChild(i).gameObject);
+
+        hanging.Clear();
+        fallers.Clear();
+        detachedChunks.Clear();
+        queue.Clear();
+        palette.Clear();
+
+        cutting = false;
+        clogged = false;
+        sweepConsumed = false;
+        statusText = null;
+        cutStartRing = cutCurrentRing = null;
+        cutGuidePS = hangingPS = fallingPS = null;
+        for (int i = 0; i < ACTIVE_JARS; i++) { slots[i] = null; previewBox[i] = null; previewText[i] = null; }
+    }
+
+    // ---- on-screen seed overlay ----------------------------------------
+
+    void OnGUI()
+    {
+        if (seedLabelStyle == null)
+        {
+            seedLabelStyle = new GUIStyle(GUI.skin.label) { fontSize = 16, fontStyle = FontStyle.Bold };
+            seedBtnStyle = new GUIStyle(GUI.skin.button) { fontSize = 13 };
+        }
+
+        const float pad = 10f;
+        GUI.Label(new Rect(pad, pad, 360f, 24f), "Seed: " + activeSeed, seedLabelStyle);
+        if (GUI.Button(new Rect(pad, pad + 26f, 90f, 26f), "Copy", seedBtnStyle))
+            GUIUtility.systemCopyBuffer = activeSeed.ToString();
     }
 
     // ---- setup ----------------------------------------------------------
