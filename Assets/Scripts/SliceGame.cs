@@ -33,7 +33,18 @@ public class SliceGame : MonoBehaviour
     public int capacityMin = 5;
     public int capacityMax = 15;
     public float colorMatch = 0.30f;  // max color distance a jar will accept
+
+    [Header("Color grouping")]
+    // How close two colors must be to count as the same color for sorting.
+    [Range(0.05f, 0.8f)] public float colorMergeDistance = 0.25f;
+    // How much lightness matters next to hue. Lower = a dark shade and a bright
+    // shade of one hue fold together more eagerly.
+    [Range(0f, 1f)] public float lightnessWeight = 0.5f;
     public int tubeCapacity = 0;      // 0 = auto (fills tube geometry)
+
+    [Header("Pixel look")]
+    public bool pixelOutline = true;                     // thin dark border around every pixel
+    [Range(0.02f, 0.25f)] public float pixelOutlineWidth = 0.09f;   // per side, fraction of a pixel
 
     [Header("Cut")]
     public float fingerPixels = 3.6f; // kept for existing scene tuning; cut width in pixel-widths
@@ -45,17 +56,18 @@ public class SliceGame : MonoBehaviour
     const float ORTHO_SIZE = 5f;
     const float MIN_SWIPE = 0.2f;
     const int PALETTE_MAX = 5;
-    const int ACTIVE_JARS = 2;
+    const int ACTIVE_JARS = 3;
     const int CUT_GUIDE_SORT_ORDER = 100;
 
     static readonly Color FRAME_COLOR = new Color(0.9f, 0.9f, 0.9f, 1f);
     static readonly Color BG_COLOR = new Color(0.96f, 0.96f, 0.86f, 1f);
     static readonly Color MACHINE_COLOR = new Color(0.55f, 0.58f, 0.65f, 1f);
     static readonly Color CUT_GUIDE_COLOR = new Color(1f, 0f, 0f, 1f);
+    static readonly Color PIXEL_OUTLINE_COLOR = new Color(0.04f, 0.04f, 0.07f, 1f);
 
-    struct Px { public Vector3 pos; public Color col; public int pi; public int x, y; }   // pi = palette index
+    protected struct Px { public Vector3 pos; public Color col; public int pi; public int x, y; }   // pi = palette index
 
-    class Faller
+    protected class Faller
     {
         public Vector3 pos;
         public float vx;       // horizontal velocity (impulse pop in the picture zone)
@@ -91,24 +103,28 @@ public class SliceGame : MonoBehaviour
     }
 
     ParticleSystem hangingPS, fallingPS;
+    ParticleSystem hangingOutlinePS, fallingOutlinePS;
     ParticleSystem cutGuidePS;
-    readonly List<Px> hanging = new List<Px>();
-    readonly List<Faller> fallers = new List<Faller>();
+    protected readonly List<Px> hanging = new List<Px>();
+    protected readonly List<Faller> fallers = new List<Faller>();
     readonly List<DetachedChunk> detachedChunks = new List<DetachedChunk>();
     ParticleSystem.Particle[] buf = new ParticleSystem.Particle[256];
     ParticleSystem.Particle[] cutBuf = new ParticleSystem.Particle[256];
 
-    Camera cam;
-    float W, H, pixel;
-    int texW, texH;
+    protected Camera cam;
+    protected float W, H, pixel;
+    protected int texW, texH;
 
-    float funnelTopY, tubeTopY, tubeBotY, jarTopY, jarBottomY, pictureCenterY, previewY;
-    float tubeHalfW, funnelHalfW, jarInnerHalfW, previewHalfW, previewHalfH;
-    float eraseRadius;
+    protected float funnelTopY, tubeTopY, tubeBotY, jarTopY, jarBottomY, pictureCenterY, previewY;
+    protected float tubeHalfW, funnelHalfW, jarInnerHalfW, previewHalfW, previewHalfH;
+    protected float pictureZoneW, pictureZoneH;
+    protected float eraseRadius;
     readonly float[] jarCenterX = new float[ACTIVE_JARS];
     int jarPerRow, backlogPerRow, backlogCapacity;
 
     readonly List<Color> palette = new List<Color>();
+    readonly List<Vector3> palettePoints = new List<Vector3>();
+    readonly Dictionary<Color, int> shadeFamily = new Dictionary<Color, int>();
     int[] paletteCount;
     readonly Slot[] slots = new Slot[ACTIVE_JARS];
     readonly Queue<JarDef> queue = new Queue<JarDef>();
@@ -118,16 +134,16 @@ public class SliceGame : MonoBehaviour
     bool cutting;
     Vector3 cutStart, cutCurrent;
 
-    bool clogged;
-    TextMesh statusText;
-    Font uiFont;
+    protected bool clogged;
+    protected TextMesh statusText;
+    protected Font uiFont;
 
     int activeSeed;                   // the seed the current level was actually built with
     GUIStyle seedLabelStyle, seedBtnStyle;
 
     public int CurrentSeed => activeSeed;
 
-    void Start()
+    protected virtual void Start()
     {
         InitSeed();
         Build();
@@ -141,7 +157,7 @@ public class SliceGame : MonoBehaviour
         Random.InitState(activeSeed);
     }
 
-    void Build()
+    protected virtual void Build()
     {
         SetupCamera();
         ComputeFrameBounds();
@@ -170,7 +186,7 @@ public class SliceGame : MonoBehaviour
         Build();
     }
 
-    void Teardown()
+    protected virtual void Teardown()
     {
         for (int i = transform.childCount - 1; i >= 0; i--)
             Destroy(transform.GetChild(i).gameObject);
@@ -180,6 +196,8 @@ public class SliceGame : MonoBehaviour
         detachedChunks.Clear();
         queue.Clear();
         palette.Clear();
+        palettePoints.Clear();
+        shadeFamily.Clear();
 
         cutting = false;
         clogged = false;
@@ -187,6 +205,7 @@ public class SliceGame : MonoBehaviour
         statusText = null;
         cutStartRing = cutCurrentRing = null;
         cutGuidePS = hangingPS = fallingPS = null;
+        hangingOutlinePS = fallingOutlinePS = null;
         for (int i = 0; i < ACTIVE_JARS; i++) { slots[i] = null; previewBox[i] = null; previewText[i] = null; }
     }
 
@@ -231,7 +250,9 @@ public class SliceGame : MonoBehaviour
         W = ORTHO_SIZE * cam.aspect * 0.92f;
     }
 
-    void ComputeLayout()
+    // Vertical bands of the machine + the picture zone size. Split out so a
+    // variation can move things around without copying the derived math below.
+    protected virtual void ConfigureBands()
     {
         funnelTopY = 0.35f * H;
         tubeTopY = 0.14f * H;
@@ -241,15 +262,22 @@ public class SliceGame : MonoBehaviour
         previewY = -0.84f * H;
         pictureCenterY = 0.62f * H;
 
-        float zoneH = 0.55f * H;
-        float zoneW = 1.6f * W;
-        pixel = Mathf.Min(zoneH / Mathf.Max(1, texH), zoneW / Mathf.Max(1, texW));
+        pictureZoneH = 0.55f * H;
+        pictureZoneW = 1.6f * W;
+    }
+
+    protected virtual void ComputeLayout()
+    {
+        ConfigureBands();
+        pixel = Mathf.Min(pictureZoneH / Mathf.Max(1, texH), pictureZoneW / Mathf.Max(1, texW));
 
         tubeHalfW = Mathf.Max(pixel * 3f, 0.08f * W);
         funnelHalfW = 0.45f * W;
-        jarInnerHalfW = 0.26f * W;
-        jarCenterX[0] = -0.34f * W;
-        jarCenterX[1] = 0.34f * W;
+        float jarSpan = 0.92f * W;                       // total width the jar row may use
+        float jarSlotW = 2f * jarSpan / ACTIVE_JARS;
+        jarInnerHalfW = jarSlotW * 0.42f;                // 8% gap between neighbours
+        for (int i = 0; i < ACTIVE_JARS; i++)
+            jarCenterX[i] = -jarSpan + jarSlotW * (i + 0.5f);
         jarPerRow = Mathf.Max(1, Mathf.FloorToInt(2f * jarInnerHalfW / pixel));
 
         previewHalfW = 0.14f * W;
@@ -334,7 +362,7 @@ public class SliceGame : MonoBehaviour
             }
     }
 
-    Vector3 PixelToWorld(int x, int y)
+    protected Vector3 PixelToWorld(int x, int y)
     {
         float wx = (x - (texW - 1) * 0.5f) * pixel;
         float wy = (y - (texH - 1) * 0.5f) * pixel + pictureCenterY;
@@ -343,48 +371,153 @@ public class SliceGame : MonoBehaviour
 
     // ---- palette --------------------------------------------------------
 
+    // Colors live on a cone: angle = hue, radius = saturation, height = lightness.
+    // Distances there behave the way people talk about color — two shades of red
+    // sit next to each other, red and orange do not — and grays collapse onto the
+    // axis instead of picking up a meaningless hue.
+    Vector3 ColorPoint(Color c)
+    {
+        Color.RGBToHSV(c, out float h, out float s, out float v);
+        float a = h * Mathf.PI * 2f;
+        return new Vector3(Mathf.Cos(a) * s, Mathf.Sin(a) * s, v * lightnessWeight);
+    }
+
+    class Family
+    {
+        public Vector3 center;
+        public Color dominant;                      // most common real shade — this is what the jar shows
+        public int weight;
+        public readonly List<int> members = new List<int>();   // indices into the distinct-shade list
+    }
+
+    // Fold every shade in the picture into a handful of color families, so hand
+    // shading, anti-aliasing and JPEG mush all sort into one jar while genuinely
+    // different colors stay apart. Pixels keep their own shade on screen — only
+    // the sorting is grouped.
+    //
+    // Two passes: a greedy sweep that swallows near-duplicates, then agglomerative
+    // merging of the closest families. Merging stops once everything left is far
+    // enough apart — or, if there are still too many, once only PALETTE_MAX remain.
+    // The second pass is what lets a chain of shades (bright red -> mid -> dark)
+    // end up in one family even though the ends are far apart.
     void ExtractPalette()
     {
-        var sum = new Dictionary<int, Vector4>();
-        foreach (var p in hanging)
-        {
-            int key = Quant(p.col);
-            Vector4 v = sum.TryGetValue(key, out var cur) ? cur : Vector4.zero;
-            v.x += p.col.r; v.y += p.col.g; v.z += p.col.b; v.w += 1f;
-            sum[key] = v;
-        }
-        var list = new List<Vector4>(sum.Values);
-        list.Sort((a, b) => b.w.CompareTo(a.w));
-
         palette.Clear();
-        foreach (var v in list)
+        palettePoints.Clear();
+        shadeFamily.Clear();
+
+        var tally = new Dictionary<Color, int>();
+        foreach (var p in hanging) tally[p.col] = tally.TryGetValue(p.col, out int n) ? n + 1 : 1;
+        if (tally.Count == 0)
         {
-            if (palette.Count >= PALETTE_MAX) break;
-            palette.Add(new Color(v.x / v.w, v.y / v.w, v.z / v.w, 1f));
+            AddPaletteEntry(Color.red);
+            AddPaletteEntry(Color.green);
+            AddPaletteEntry(Color.blue);
+            return;
         }
-        if (palette.Count == 0) { palette.Add(Color.red); palette.Add(Color.green); palette.Add(Color.blue); }
+
+        var shades = new List<Color>(tally.Keys);
+        shades.Sort((a, b) => tally[b].CompareTo(tally[a]));      // most common first
+        var points = new List<Vector3>(shades.Count);
+        foreach (var c in shades) points.Add(ColorPoint(c));
+
+        var families = SeedFamilies(shades, points, tally);
+        MergeFamilies(families, shades, points, tally);
+        families.Sort((a, b) => b.weight.CompareTo(a.weight));
+
+        for (int i = 0; i < families.Count; i++)
+        {
+            AddPaletteEntry(families[i].dominant, families[i].center);
+            foreach (int m in families[i].members) shadeFamily[shades[m]] = i;
+        }
     }
 
-    static int Quant(Color c)
+    void AddPaletteEntry(Color c) => AddPaletteEntry(c, ColorPoint(c));
+
+    void AddPaletteEntry(Color c, Vector3 point)
     {
-        int r = Mathf.RoundToInt(c.r * 4f);
-        int g = Mathf.RoundToInt(c.g * 4f);
-        int b = Mathf.RoundToInt(c.b * 4f);
-        return (r * 5 + g) * 5 + b;
+        palette.Add(c);
+        palettePoints.Add(point);
     }
 
-    static float ColorDist2(Color a, Color b)
+    // Pass 1: walk the shades most-common-first, dropping each into the first
+    // family it is practically identical to. Kills noise before the real work.
+    List<Family> SeedFamilies(List<Color> shades, List<Vector3> points, Dictionary<Color, int> tally)
     {
-        float dr = a.r - b.r, dg = a.g - b.g, db = a.b - b.b;
-        return dr * dr + dg * dg + db * db;
+        var families = new List<Family>();
+        float near2 = Mathf.Pow(colorMergeDistance * 0.4f, 2f);
+
+        for (int i = 0; i < shades.Count; i++)
+        {
+            int hit = -1;
+            for (int k = 0; k < families.Count; k++)
+                if ((families[k].center - points[i]).sqrMagnitude <= near2) { hit = k; break; }
+
+            if (hit < 0)
+            {
+                var f = new Family { center = points[i], dominant = shades[i] };
+                f.members.Add(i);
+                families.Add(f);
+            }
+            else families[hit].members.Add(i);
+        }
+
+        foreach (var f in families) Recenter(f, shades, points, tally);
+        return families;
     }
 
+    // Pass 2: repeatedly glue together the two closest families.
+    void MergeFamilies(List<Family> families, List<Color> shades, List<Vector3> points,
+                       Dictionary<Color, int> tally)
+    {
+        float merge2 = colorMergeDistance * colorMergeDistance;
+        while (families.Count > 1)
+        {
+            int bi = 0, bj = 1;
+            float best = float.MaxValue;
+            for (int i = 0; i < families.Count; i++)
+                for (int j = i + 1; j < families.Count; j++)
+                {
+                    float d = (families[i].center - families[j].center).sqrMagnitude;
+                    if (d < best) { best = d; bi = i; bj = j; }
+                }
+
+            if (best > merge2 && families.Count <= PALETTE_MAX) break;
+
+            families[bi].members.AddRange(families[bj].members);
+            families.RemoveAt(bj);
+            Recenter(families[bi], shades, points, tally);
+        }
+    }
+
+    void Recenter(Family f, List<Color> shades, List<Vector3> points, Dictionary<Color, int> tally)
+    {
+        Vector3 sum = Vector3.zero;
+        int total = 0, top = -1;
+        foreach (int m in f.members)
+        {
+            int n = tally[shades[m]];
+            sum += points[m] * n;
+            total += n;
+            if (n > top) { top = n; f.dominant = shades[m]; }
+        }
+        if (total > 0) f.center = sum / total;
+        f.weight = total;
+    }
+
+    // Which family a shade sorts into. Every shade in the picture was mapped
+    // during grouping; anything else (a color that only shows up later) falls
+    // back to the nearest family center.
     int NearestPaletteIndex(Color c)
     {
-        int best = 0; float bd = float.MaxValue;
-        for (int i = 0; i < palette.Count; i++)
+        if (shadeFamily.TryGetValue(c, out int known)) return known;
+
+        Vector3 pt = ColorPoint(c);
+        int best = 0;
+        float bd = float.MaxValue;
+        for (int i = 0; i < palettePoints.Count; i++)
         {
-            float d = ColorDist2(c, palette[i]);
+            float d = (palettePoints[i] - pt).sqrMagnitude;
             if (d < bd) { bd = d; best = i; }
         }
         return best;
@@ -558,7 +691,7 @@ public class SliceGame : MonoBehaviour
                 new Vector3(0, tubeBotY, 0), new Vector3(jarCenterX[i], jarTopY, 0));
     }
 
-    LineRenderer MakeLine(string name, Color c, float width, bool loop, params Vector3[] pts)
+    protected LineRenderer MakeLine(string name, Color c, float width, bool loop, params Vector3[] pts)
     {
         var go = new GameObject(name);
         go.transform.SetParent(transform, false);
@@ -574,7 +707,7 @@ public class SliceGame : MonoBehaviour
         return lr;
     }
 
-    TextMesh MakeText(string name, Vector3 pos, float worldHeight, Color c)
+    protected TextMesh MakeText(string name, Vector3 pos, float worldHeight, Color c)
     {
         var go = new GameObject(name);
         go.transform.SetParent(transform, false);
@@ -595,11 +728,21 @@ public class SliceGame : MonoBehaviour
 
     void BuildParticleSystems()
     {
+        // The outline layers sit behind at full pixel size while the color layers
+        // on top are shrunk, so the dark backing peeks out as a thin border.
+        hangingOutlinePS = MakePS("HangingOutlinePS");
+        fallingOutlinePS = MakePS("FallingOutlinePS");
+        hangingOutlinePS.GetComponent<ParticleSystemRenderer>().sortingOrder = -1;
+        fallingOutlinePS.GetComponent<ParticleSystemRenderer>().sortingOrder = -1;
+
         hangingPS = MakePS("HangingPS");
         fallingPS = MakePS("FallingPS");
     }
 
-    void BuildCutPreviewVisual()
+    // size of the colored quad: shrunk to leave room for the outline behind it
+    float PixelFill => pixelOutline ? pixel * (1f - pixelOutlineWidth * 2f) : pixel;
+
+    protected virtual void BuildCutPreviewVisual()
     {
         cutGuidePS = MakePS("CutGuidePS");
         var main = cutGuidePS.main;
@@ -644,12 +787,16 @@ public class SliceGame : MonoBehaviour
         return ps;
     }
 
-    void UploadHanging()
+    protected void UploadHanging()
     {
         int n = hanging.Count;
         EnsureBuf(n);
         for (int i = 0; i < n; i++) FillParticle(ref buf[i], hanging[i].pos, hanging[i].col);
         hangingPS.SetParticles(buf, n);
+
+        if (!pixelOutline) { hangingOutlinePS.SetParticles(buf, 0); return; }
+        for (int i = 0; i < n; i++) FillOutlineParticle(ref buf[i], hanging[i].pos);
+        hangingOutlinePS.SetParticles(buf, n);
     }
 
     void RenderFallers()
@@ -668,6 +815,18 @@ public class SliceGame : MonoBehaviour
             foreach (var p in c.pixels)
                 FillParticle(ref buf[n++], p.pos, p.col);
         fallingPS.SetParticles(buf, n);
+
+        if (!pixelOutline) { fallingOutlinePS.SetParticles(buf, 0); return; }
+        n = 0;
+        foreach (var f in fallers)
+        {
+            if (f.consumed) continue;
+            FillOutlineParticle(ref buf[n++], f.pos);
+        }
+        foreach (var c in detachedChunks)
+            foreach (var p in c.pixels)
+                FillOutlineParticle(ref buf[n++], p.pos);
+        fallingOutlinePS.SetParticles(buf, n);
     }
 
     void EnsureBuf(int n) { if (buf.Length < Mathf.Max(1, n)) buf = new ParticleSystem.Particle[Mathf.Max(1, n)]; }
@@ -676,10 +835,16 @@ public class SliceGame : MonoBehaviour
     {
         p.position = pos;
         p.velocity = Vector3.zero;
-        p.startSize = pixel;
+        p.startSize = PixelFill;
         p.startColor = col;
         p.startLifetime = 1e9f;
         p.remainingLifetime = 1e9f;
+    }
+
+    void FillOutlineParticle(ref ParticleSystem.Particle p, Vector3 pos)
+    {
+        FillParticle(ref p, pos, PIXEL_OUTLINE_COLOR);
+        p.startSize = pixel;
     }
 
     void FillGuideParticle(ref ParticleSystem.Particle p, Vector3 pos, Color col)
@@ -690,7 +855,7 @@ public class SliceGame : MonoBehaviour
 
     // ---- simulation -----------------------------------------------------
 
-    void Update()
+    protected virtual void Update()
     {
         HandleInput();
         Simulate(Time.deltaTime);
@@ -817,7 +982,7 @@ public class SliceGame : MonoBehaviour
 
     // First tap anchors point A. Dragging previews point B and the cut segment.
     // Releasing cuts the picture along the segment and shatters the smaller side.
-    void HandleInput()
+    protected virtual void HandleInput()
     {
         if (Input.GetKeyDown(KeyCode.Space)) ReleaseAll();
 
@@ -884,7 +1049,7 @@ public class SliceGame : MonoBehaviour
         cutGuidePS.SetParticles(cutBuf, n);
     }
 
-    void UpdateCircle(LineRenderer lr, Vector3 center, float radius)
+    protected void UpdateCircle(LineRenderer lr, Vector3 center, float radius)
     {
         if (lr == null) return;
 
@@ -942,7 +1107,7 @@ public class SliceGame : MonoBehaviour
         UploadHanging();
     }
 
-    void ShatterPixel(Px p, Vector2 dir, float impulse)
+    protected void ShatterPixel(Px p, Vector2 dir, float impulse)
     {
         if (dir.sqrMagnitude < 1e-5f)
         {
@@ -960,7 +1125,7 @@ public class SliceGame : MonoBehaviour
         });
     }
 
-    void DetachSeparatedPieces(bool shatterDetached, Vector3 cutA, Vector3 cutB)
+    protected void DetachSeparatedPieces(bool shatterDetached, Vector3 cutA, Vector3 cutB)
     {
         if (hanging.Count <= 1) return;
 
@@ -1030,11 +1195,7 @@ public class SliceGame : MonoBehaviour
         foreach (var p in pixels) center += new Vector2(p.pos.x, p.pos.y);
         center /= pixels.Count;
 
-        Vector2 cutDir = new Vector2(cutB.x - cutA.x, cutB.y - cutA.y);
-        Vector2 cutNormal = cutDir.sqrMagnitude > 1e-5f ? new Vector2(-cutDir.y, cutDir.x).normalized : Vector2.up;
-        float side = Mathf.Sign(Vector2.Dot(center - new Vector2(cutA.x, cutA.y), cutNormal));
-        if (side == 0f) side = 1f;
-        Vector2 baseDir = cutNormal * side;
+        Vector2 baseDir = ChunkShatterDir(center, cutA, cutB);
 
         foreach (var p in pixels)
         {
@@ -1042,6 +1203,17 @@ public class SliceGame : MonoBehaviour
             Vector2 dir = (baseDir * 0.85f + fromCenter.normalized * 0.55f).normalized;
             ShatterPixel(p, dir, eraseImpulse * Random.Range(0.85f, 1.35f));
         }
+    }
+
+    // Which way a detached chunk sprays. Cut-driven here; blast variations push
+    // the chunk away from the explosion instead.
+    protected virtual Vector2 ChunkShatterDir(Vector2 center, Vector3 cutA, Vector3 cutB)
+    {
+        Vector2 cutDir = new Vector2(cutB.x - cutA.x, cutB.y - cutA.y);
+        Vector2 cutNormal = cutDir.sqrMagnitude > 1e-5f ? new Vector2(-cutDir.y, cutDir.x).normalized : Vector2.up;
+        float side = Mathf.Sign(Vector2.Dot(center - new Vector2(cutA.x, cutA.y), cutNormal));
+        if (side == 0f) side = 1f;
+        return cutNormal * side;
     }
 
     int[,] BuildHangingIndexGrid()
@@ -1065,7 +1237,7 @@ public class SliceGame : MonoBehaviour
         q.Enqueue(idx);
     }
 
-    bool[,] BuildHangingGrid()
+    protected bool[,] BuildHangingGrid()
     {
         var occupied = new bool[texW, texH];
         foreach (var p in hanging) occupied[p.x, p.y] = true;
@@ -1107,7 +1279,7 @@ public class SliceGame : MonoBehaviour
         return x < 0 || x >= texW || y < 0 || y >= texH || !occupied[x, y];
     }
 
-    Vector3 ScreenToWorld(Vector3 screen)
+    protected Vector3 ScreenToWorld(Vector3 screen)
     {
         screen.z = -cam.transform.position.z;
         var w = cam.ScreenToWorldPoint(screen);

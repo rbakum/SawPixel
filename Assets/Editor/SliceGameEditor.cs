@@ -3,7 +3,7 @@ using UnityEngine;
 
 // Inspector add-on for SliceGame: lets you type a seed and start a level with
 // exactly that seed (in Play mode), or roll a fresh random one.
-[CustomEditor(typeof(SliceGame))]
+[CustomEditor(typeof(SliceGame), true)]
 public class SliceGameEditor : Editor
 {
     int seedInput;
