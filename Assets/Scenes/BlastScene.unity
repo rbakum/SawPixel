@@ -405,7 +405,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 405a0a19349c48b0a63ce8b85dffb2ce, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  sourceTexture: {fileID: 2800000, guid: 7567a9296be4b4f77aa096031c5b213b, type: 3}
+  sourceTexture: {fileID: 2800000, guid: 027f027a2c5e94fff97e24223c9df44c, type: 3}
   maxResolution: 100
   useFixedSeed: 0
   seed: 1949863276
@@ -415,12 +415,27 @@ MonoBehaviour:
   capacityMin: 50
   capacityMax: 100
   colorMatch: 0.3
+  colorMergeDistance: 0.25
+  lightnessWeight: 0.5
+  maxColorFamilies: 10
   tubeCapacity: 200
+  glossTexture: {fileID: 2800000, guid: 4fce42c9dd8c7432bb1d44784c5f7c56, type: 3}
+  glossStrength: 1
+  roundedPixels: 1
   fingerPixels: 4.5
   eraseImpulse: 4
   cutGuideWidthPixels: 0.22
   cutGuideDashPixels: 0.85
   cutGuideGapPixels: 0.55
+  targetSpots: 8
+  bombRadiusMinPixels: 1.6
+  minVisibleSpots: 3
+  spotMarkerPixels: 1.2
+  rocketHeightPixels: 3
+  blastImpulse: 5
+  spotSpacing: 1.3
+  bombShare: 0.667
+  visibleShare: 0.5
 --- !u!4 &1379775640
 Transform:
   m_ObjectHideFlags: 0

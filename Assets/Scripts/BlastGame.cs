@@ -19,7 +19,13 @@ using UnityEngine;
 public class BlastGame : SliceGame
 {
     [Header("Blast")]
-    public float bombRadiusPixels = 10f;   // bomb erases a disc of this radius (picture pixels)
+    // Bomb size is NOT fixed in pixels: a 24x24 picture and a 100x100 one should
+    // both give the player a decent number of targets, so the radius is solved
+    // from how many targets a level wants.
+    public int targetSpots = 8;            // roughly how many spots a fresh plan aims for
+    public float bombRadiusMinPixels = 1.6f;
+    public int minVisibleSpots = 3;        // never show fewer than this while there is picture left
+    public float spotMarkerPixels = 1.2f;  // marker radius, in picture pixels
     public int rocketHeightPixels = 3;     // rocket erases a band this many pixels tall
     public float blastImpulse = 5f;
     public float spotSpacing = 1.3f;       // spot lattice step = bomb radius * this
@@ -61,6 +67,7 @@ public class BlastGame : SliceGame
     Weapon dragging = Weapon.None;
     Spot hovered;
     int visibleTarget;
+    float bombRadius;                      // in picture pixels, solved once per level
 
     // ---- layout ---------------------------------------------------------
 
@@ -109,16 +116,27 @@ public class BlastGame : SliceGame
         hintText = null;
         for (int i = 0; i < 2; i++) { slotIcon[i] = null; slotText[i] = null; ammo[i] = 0; }
         visibleTarget = 0;
+        bombRadius = 0f;
     }
 
     // ---- spots ------------------------------------------------------------
 
     void BuildSpots()
     {
+        ComputeBombRadius();
         var coords = PlanSpotCoords();
         StockUp(coords);
-        visibleTarget = Mathf.Max(1, Mathf.CeilToInt(coords.Count * visibleShare));
+        visibleTarget = Mathf.Max(minVisibleSpots, Mathf.CeilToInt(coords.Count * visibleShare));
         TopUpVisible();
+    }
+
+    // Solve the hex lattice backwards: a step of r * spotSpacing tiles the picture
+    // into cells of step^2 * 0.87, and we want targetSpots of them. Done once on
+    // the full picture so the bomb keeps the same size all level.
+    void ComputeBombRadius()
+    {
+        float cells = Mathf.Max(1, targetSpots) * spotSpacing * spotSpacing * 0.87f;
+        bombRadius = Mathf.Max(bombRadiusMinPixels, Mathf.Sqrt(hanging.Count / cells));
     }
 
     // Pool a planned wave of spots and hand out the ammo that goes with it:
@@ -157,7 +175,7 @@ public class BlastGame : SliceGame
 
         bool[,] occupied = BuildHangingGrid();
         var covered = new bool[texW, texH];
-        float r = Mathf.Max(1.5f, bombRadiusPixels);
+        float r = bombRadius;
         float step = Mathf.Max(2f, r * spotSpacing);
 
         int row = 0;
@@ -237,7 +255,7 @@ public class BlastGame : SliceGame
     void ActivateSpot(Vector2Int c)
     {
         var s = new Spot { gx = c.x, gy = c.y, pos = PixelToWorld(c.x, c.y) };
-        float rr = Mathf.Max(pixel * 2.4f, 0.09f);
+        float rr = Mathf.Max(pixel * spotMarkerPixels, 0.045f);
 
         s.ring = MakeLine("SpotRing", SPOT_RING, rr * 0.42f, true, Vector3.zero);
         s.halo = MakeLine("SpotHalo", SPOT_HALO, rr * 0.30f, true, Vector3.zero);
@@ -274,7 +292,7 @@ public class BlastGame : SliceGame
     {
         if (active.Count == 0) return;
         bool[,] occupied = BuildHangingGrid();
-        float r = Mathf.Max(1.5f, bombRadiusPixels);
+        float r = bombRadius;
         for (int i = active.Count - 1; i >= 0; i--)
             if (!NearestOccupied(active[i].gx, active[i].gy, occupied, r, out _))
                 DropSpot(active[i]);
@@ -424,7 +442,7 @@ public class BlastGame : SliceGame
         blastPreview.enabled = true;
         if (dragging == Weapon.Bomb)
         {
-            UpdateCircle(blastPreview, hovered.pos, bombRadiusPixels * pixel);
+            UpdateCircle(blastPreview, hovered.pos, bombRadius * pixel);
         }
         else
         {
@@ -443,7 +461,7 @@ public class BlastGame : SliceGame
 
     void Detonate(Spot s, Weapon w)
     {
-        if (w == Weapon.Bomb) BlastDisc(s.pos, bombRadiusPixels * pixel);
+        if (w == Weapon.Bomb) BlastDisc(s.pos, bombRadius * pixel);
         else BlastBand(s.pos, rocketHeightPixels * pixel * 0.5f);
 
         ammo[(int)w] = Mathf.Max(0, ammo[(int)w] - 1);

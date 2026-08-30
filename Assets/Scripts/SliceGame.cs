@@ -40,11 +40,18 @@ public class SliceGame : MonoBehaviour
     // How much lightness matters next to hue. Lower = a dark shade and a bright
     // shade of one hue fold together more eagerly.
     [Range(0f, 1f)] public float lightnessWeight = 0.5f;
+    // Hard cap on color families. Once this many are left, merging keeps going
+    // even between colors that are NOT alike — set it too low and reds, oranges
+    // and yellows get crushed into one jar.
+    [Range(2, 16)] public int maxColorFamilies = 10;
     public int tubeCapacity = 0;      // 0 = auto (fills tube geometry)
 
     [Header("Pixel look")]
-    public bool pixelOutline = true;                     // thin dark border around every pixel
-    [Range(0.02f, 0.25f)] public float pixelOutlineWidth = 0.09f;   // per side, fraction of a pixel
+    public Texture2D glossTexture;                       // stamped additively over every pixel
+    [Range(0f, 2f)] public float glossStrength = 1f;     // 0 = off, 1 = as authored
+    // Cut the pixel quads to the gloss texture's own silhouette, so the rounded
+    // highlight isn't sitting on a square. Same asset = corners always match.
+    public bool roundedPixels = true;
 
     [Header("Cut")]
     public float fingerPixels = 3.6f; // kept for existing scene tuning; cut width in pixel-widths
@@ -55,15 +62,15 @@ public class SliceGame : MonoBehaviour
 
     const float ORTHO_SIZE = 5f;
     const float MIN_SWIPE = 0.2f;
-    const int PALETTE_MAX = 5;
     const int ACTIVE_JARS = 3;
     const int CUT_GUIDE_SORT_ORDER = 100;
+    const string GLOSS_SHADER = "SawPixel/PixelGloss";
+    const string SHAPE_SHADER = "SawPixel/PixelShape";
 
     static readonly Color FRAME_COLOR = new Color(0.9f, 0.9f, 0.9f, 1f);
     static readonly Color BG_COLOR = new Color(0.96f, 0.96f, 0.86f, 1f);
     static readonly Color MACHINE_COLOR = new Color(0.55f, 0.58f, 0.65f, 1f);
     static readonly Color CUT_GUIDE_COLOR = new Color(1f, 0f, 0f, 1f);
-    static readonly Color PIXEL_OUTLINE_COLOR = new Color(0.04f, 0.04f, 0.07f, 1f);
 
     protected struct Px { public Vector3 pos; public Color col; public int pi; public int x, y; }   // pi = palette index
 
@@ -103,7 +110,8 @@ public class SliceGame : MonoBehaviour
     }
 
     ParticleSystem hangingPS, fallingPS;
-    ParticleSystem hangingOutlinePS, fallingOutlinePS;
+    ParticleSystem hangingGlossPS, fallingGlossPS;
+    bool glossOn;
     ParticleSystem cutGuidePS;
     protected readonly List<Px> hanging = new List<Px>();
     protected readonly List<Faller> fallers = new List<Faller>();
@@ -205,7 +213,8 @@ public class SliceGame : MonoBehaviour
         statusText = null;
         cutStartRing = cutCurrentRing = null;
         cutGuidePS = hangingPS = fallingPS = null;
-        hangingOutlinePS = fallingOutlinePS = null;
+        hangingGlossPS = fallingGlossPS = null;
+        glossOn = false;
         for (int i = 0; i < ACTIVE_JARS; i++) { slots[i] = null; previewBox[i] = null; previewText[i] = null; }
     }
 
@@ -397,7 +406,7 @@ public class SliceGame : MonoBehaviour
     //
     // Two passes: a greedy sweep that swallows near-duplicates, then agglomerative
     // merging of the closest families. Merging stops once everything left is far
-    // enough apart — or, if there are still too many, once only PALETTE_MAX remain.
+    // enough apart — or, if there are still too many, once only maxColorFamilies remain.
     // The second pass is what lets a chain of shades (bright red -> mid -> dark)
     // end up in one family even though the ends are far apart.
     void ExtractPalette()
@@ -482,7 +491,7 @@ public class SliceGame : MonoBehaviour
                     if (d < best) { best = d; bi = i; bj = j; }
                 }
 
-            if (best > merge2 && families.Count <= PALETTE_MAX) break;
+            if (best > merge2 && families.Count <= maxColorFamilies) break;
 
             families[bi].members.AddRange(families[bj].members);
             families.RemoveAt(bj);
@@ -728,19 +737,33 @@ public class SliceGame : MonoBehaviour
 
     void BuildParticleSystems()
     {
-        // The outline layers sit behind at full pixel size while the color layers
-        // on top are shrunk, so the dark backing peeks out as a thin border.
-        hangingOutlinePS = MakePS("HangingOutlinePS");
-        fallingOutlinePS = MakePS("FallingOutlinePS");
-        hangingOutlinePS.GetComponent<ParticleSystemRenderer>().sortingOrder = -1;
-        fallingOutlinePS.GetComponent<ParticleSystemRenderer>().sortingOrder = -1;
-
         hangingPS = MakePS("HangingPS");
         fallingPS = MakePS("FallingPS");
-    }
+        ApplyPixelShape();
 
-    // size of the colored quad: shrunk to leave room for the outline behind it
-    float PixelFill => pixelOutline ? pixel * (1f - pixelOutlineWidth * 2f) : pixel;
+        // A second quad per pixel, same place and size, drawn on top with the
+        // gloss texture added to whatever color is underneath.
+        var shader = Shader.Find(GLOSS_SHADER);
+        glossOn = glossTexture != null && glossStrength > 0f && shader != null;
+        if (!glossOn)
+        {
+            if (glossStrength > 0f)
+                Debug.LogWarning("[" + GetType().Name + "] pixel gloss is off: " + (glossTexture == null
+                    ? "no Gloss Texture assigned on the component"
+                    : "shader '" + GLOSS_SHADER + "' not found"), this);
+            return;
+        }
+
+        var mat = new Material(shader) { mainTexture = glossTexture };
+        hangingGlossPS = MakePS("HangingGlossPS");
+        fallingGlossPS = MakePS("FallingGlossPS");
+        foreach (var ps in new[] { hangingGlossPS, fallingGlossPS })
+        {
+            var r = ps.GetComponent<ParticleSystemRenderer>();
+            r.material = mat;
+            r.sortingOrder = 1;
+        }
+    }
 
     protected virtual void BuildCutPreviewVisual()
     {
@@ -754,6 +777,23 @@ public class SliceGame : MonoBehaviour
         cutStartRing.sortingOrder = CUT_GUIDE_SORT_ORDER + 1;
         cutCurrentRing.sortingOrder = CUT_GUIDE_SORT_ORDER + 1;
         SetCutPreviewVisible(false);
+    }
+
+    // Mask the color quads with the gloss texture's alpha so a pixel is a rounded
+    // square, not a hard block under a rounded highlight.
+    void ApplyPixelShape()
+    {
+        if (!roundedPixels || glossTexture == null) return;
+        var shader = Shader.Find(SHAPE_SHADER);
+        if (shader == null)
+        {
+            Debug.LogWarning("[" + GetType().Name + "] rounded pixels are off: shader '" + SHAPE_SHADER + "' not found", this);
+            return;
+        }
+
+        var mat = new Material(shader) { mainTexture = glossTexture };
+        hangingPS.GetComponent<ParticleSystemRenderer>().material = mat;
+        fallingPS.GetComponent<ParticleSystemRenderer>().material = mat;
     }
 
     ParticleSystem MakePS(string name)
@@ -794,9 +834,9 @@ public class SliceGame : MonoBehaviour
         for (int i = 0; i < n; i++) FillParticle(ref buf[i], hanging[i].pos, hanging[i].col);
         hangingPS.SetParticles(buf, n);
 
-        if (!pixelOutline) { hangingOutlinePS.SetParticles(buf, 0); return; }
-        for (int i = 0; i < n; i++) FillOutlineParticle(ref buf[i], hanging[i].pos);
-        hangingOutlinePS.SetParticles(buf, n);
+        if (!glossOn) return;
+        for (int i = 0; i < n; i++) FillGlossParticle(ref buf[i], hanging[i].pos);
+        hangingGlossPS.SetParticles(buf, n);
     }
 
     void RenderFallers()
@@ -816,17 +856,17 @@ public class SliceGame : MonoBehaviour
                 FillParticle(ref buf[n++], p.pos, p.col);
         fallingPS.SetParticles(buf, n);
 
-        if (!pixelOutline) { fallingOutlinePS.SetParticles(buf, 0); return; }
+        if (!glossOn) return;
         n = 0;
         foreach (var f in fallers)
         {
             if (f.consumed) continue;
-            FillOutlineParticle(ref buf[n++], f.pos);
+            FillGlossParticle(ref buf[n++], f.pos);
         }
         foreach (var c in detachedChunks)
             foreach (var p in c.pixels)
-                FillOutlineParticle(ref buf[n++], p.pos);
-        fallingOutlinePS.SetParticles(buf, n);
+                FillGlossParticle(ref buf[n++], p.pos);
+        fallingGlossPS.SetParticles(buf, n);
     }
 
     void EnsureBuf(int n) { if (buf.Length < Mathf.Max(1, n)) buf = new ParticleSystem.Particle[Mathf.Max(1, n)]; }
@@ -835,17 +875,15 @@ public class SliceGame : MonoBehaviour
     {
         p.position = pos;
         p.velocity = Vector3.zero;
-        p.startSize = PixelFill;
+        p.startSize = pixel;
         p.startColor = col;
         p.startLifetime = 1e9f;
         p.remainingLifetime = 1e9f;
     }
 
-    void FillOutlineParticle(ref ParticleSystem.Particle p, Vector3 pos)
-    {
-        FillParticle(ref p, pos, PIXEL_OUTLINE_COLOR);
-        p.startSize = pixel;
-    }
+    // white tint = add the gloss as authored; the shader multiplies by it
+    void FillGlossParticle(ref ParticleSystem.Particle p, Vector3 pos)
+        => FillParticle(ref p, pos, new Color(glossStrength, glossStrength, glossStrength, 1f));
 
     void FillGuideParticle(ref ParticleSystem.Particle p, Vector3 pos, Color col)
     {

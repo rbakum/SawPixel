@@ -16,6 +16,10 @@ public class PixelArtTextureImporter : AssetPostprocessor
         var ti = (TextureImporter)assetImporter;
         if (!ti.importSettingsMissing) return;          // respect manual settings
 
+        // The per-pixel gloss overlay is a smooth texture, not pixel art. Point
+        // filtering and no mipmaps turn it into aliased noise at ~10px on screen.
+        if (assetPath.EndsWith("/Pixel.png")) return;
+
         ti.textureType = TextureImporterType.Default;
         ti.npotScale = TextureImporterNPOTScale.None;
         ti.filterMode = FilterMode.Point;
