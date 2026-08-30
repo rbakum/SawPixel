@@ -29,6 +29,7 @@ public class MarbleDown : MonoBehaviour
     [Header("Sprites")]
     public Sprite[] blockSprites;              // one per color, index == color id
     public Sprite iceSprite;
+    public Sprite iceCrackedSprite;            // one neighbour left to go
     public Sprite fogSprite;
     public Sprite energySprite;
     public Sprite jarSprite;
@@ -37,22 +38,28 @@ public class MarbleDown : MonoBehaviour
     public int boardWidth = 5;
     public int boardHeight = 25;
     public int visibleRows = 9;
-    public int revealRadius = 5;
+    public int scrollLead = 1;                 // rows kept below the dig before the board moves
+    public int revealRadius = 6;
 
     [Header("Economy")]
     public int startEnergy = 8;
-    public int jarCapacity = 3;
-    public int jarReward = 1;                  // energy paid for one filled jar
-    public int piecesPerBlock = 6;
+    // Each jar asks for its own amount and pays exactly that back, so a block
+    // (one piece, one click) is worth one energy — the economy breaks even and
+    // everything you waste on a color nobody wants is a real loss.
+    public int jarCapacityMin = 2;
+    public int jarCapacityMax = 3;
+    public int piecesPerBlock = 1;
     public int jarSlots = 3;
 
     [Header("Board mix")]
     [Range(0f, 0.4f)] public float missingChance = 0.09f;
     [Range(1f, 4f)] public float missingEdgeBias = 2.2f;   // holes cluster along the walls
     [Range(0f, 0.5f)] public float doubleChance = 0.16f;
+    [Range(0f, 0.3f)] public float tripleChance = 0.10f;   // chance a double goes one layer deeper
+    [Range(0f, 0.5f)] public float crustChance = 0.08f;    // block sealed under a stone shell
     [Range(0f, 0.4f)] public float iceChance = 0.10f;
-    [Range(0f, 0.2f)] public float energyChance = 0.07f;
-    [Range(0f, 0.2f)] public float jarCellChance = 0.05f;
+    [Range(0f, 0.2f)] public float energyChance = 0.035f;
+    public int jarCellsPerLevel = 2;           // exactly this many, placed after the board is rolled
     public int plainTopRows = 2;               // no specials this close to the entrance
 
     [Header("Conveyor")]
@@ -62,19 +69,34 @@ public class MarbleDown : MonoBehaviour
     // may take it. Flying straight from the block into the jar reads as noise.
     public float beltDwell = 0.5f;
 
+    [Header("Feel")]
+    public float jarSwapTime = 0.28f;          // a jar shrinks out / pops in over this
+    public float moteTime = 0.55f;             // energy flying from a jar to the counter
+    public float floaterTime = 0.75f;          // the -1 / +N that rises off a click
+
     [Header("Seed")]
     public bool useFixedSeed;
     public int seed;
 
     const float ORTHO_SIZE = 5f;
-    const int Z_BODY = 0, Z_INNER = 1, Z_ICON = 2, Z_ICE = 3, Z_FOG = 4, Z_CELL_TEXT = 5;
-    const int Z_HUD_BG = 20, Z_HUD = 21, Z_PIECE = 24, Z_HUD_TEXT = 25;
+    const int Z_FLOOR = -2, Z_BODY = 0, Z_INNER = 1, Z_INNER2 = 2, Z_ICON = 3, Z_ICE = 4, Z_FOG = 5, Z_CELL_TEXT = 6;
+    // The jar frame used to sit ABOVE the glass, so a bonus jar was painted over
+    // as a solid gold block and its real color was invisible.
+    const int Z_HUD_BG = 20, Z_HUD_PANEL = 21, Z_JAR_FRAME = 22, Z_HUD = 23, Z_HUD_TOP = 24;
+    const int Z_PIECE = 26, Z_HUD_TEXT = 27;
 
     static readonly Color BG_COLOR = new Color(0.42f, 0.04f, 0.20f);
     static readonly Color HUD_SHELF = new Color(0.62f, 0.06f, 0.30f);
     static readonly Color BELT_COLOR = new Color(0.33f, 0.03f, 0.16f);
     static readonly Color ENERGY_PANEL = new Color(0.78f, 0.93f, 0.55f);
+    static readonly Color ENERGY_WARN = new Color(1f, 0.86f, 0.34f);          // three left
+    static readonly Color ENERGY_LOW = new Color(0.94f, 0.28f, 0.28f);        // two or less
+    static readonly Color ENERGY_LOW_FLASH = new Color(1f, 0.70f, 0.70f);
+    static readonly Color ENERGY_DIGITS = new Color(0.16f, 0.13f, 0.10f);     // readable on all three
     static readonly Color BONUS_JAR = new Color(1f, 0.84f, 0.25f);
+    static readonly Color COST_TEXT = new Color(1f, 0.55f, 0.55f);
+    static readonly Color GAIN_TEXT = new Color(0.65f, 1f, 0.45f);
+    static readonly Color OPEN_TILE = new Color(0.52f, 0.09f, 0.27f);   // dug out, but still floor
     static readonly Color DOOR_LOCKED = new Color(0.35f, 0.10f, 0.22f);
     static readonly Color DOOR_OPEN = new Color(0.55f, 1f, 0.35f);
 
@@ -88,28 +110,35 @@ public class MarbleDown : MonoBehaviour
 
     enum Kind { Block, Energy, JarCell, Missing }
 
+    // Sits in `color` when the outermost layer is stone instead of a real block:
+    // it costs a click to chip off and pays nothing back. Two clicks, one piece,
+    // so every petrified stone is one energy gone for good.
+    const int STONE = -1;
+
     class Cell
     {
         public int col, row;
         public Kind kind;
         public int color;
-        public int inner = -1;             // >= 0 => double, this hides under `color`
+        // colors hiding under `color`, outermost first. One entry = a double cell,
+        // two = a rare triple. Each click peels exactly one layer.
+        public readonly List<int> nest = new List<int>();
         public bool ice;
         public int freedNeighbours;        // broken neighbours so far; ice melts at 2
         public bool broken;
-        public int bonus;
 
         public Transform root;
-        public SpriteRenderer body, innerBody, icon, iceLayer, fog;
-        public TextMesh label;
+        public SpriteRenderer floor, body, innerBody, innerBody2, icon, iceLayer, fog;
     }
 
     class Jar
     {
         public int color;
+        public int capacity;
         public int filled;
         public int incoming;               // pieces already flying to this jar
         public bool bonus;
+        public float appear;                   // 0..1 pop-in, so jars never swap in one frame
         public Transform root;
         public SpriteRenderer glass, lid, frame;
         public TextMesh text;
@@ -137,8 +166,18 @@ public class MarbleDown : MonoBehaviour
     readonly List<Piece> toJar = new List<Piece>();
     Transform boardRoot, hudRoot, pieceRoot;
 
+    class Fading { public Transform root; public float t; }
+    class Floater { public TextMesh tm; public Vector3 from; public float t; }
+    class Mote { public SpriteRenderer sr; public Vector3 from, pos; public float t; }
+    readonly List<Fading> fadingJars = new List<Fading>();
+    readonly List<Mote> motes = new List<Mote>();
+    readonly List<Floater> floaters = new List<Floater>();
+    Vector3 energyIconPos;
+    Sprite roundedSprite;
+
     SpriteRenderer door;
     TextMesh doorText, energyText, statusText;
+    SpriteRenderer energyPanel;
 
     float halfW, halfH, cellSize;
     float windowTop, windowBottom, boardTopY;
@@ -169,7 +208,9 @@ public class MarbleDown : MonoBehaviour
         if (withSeed.HasValue) { useFixedSeed = true; seed = withSeed.Value; }
         for (int i = transform.childCount - 1; i >= 0; i--) Destroy(transform.GetChild(i).gameObject);
         jars.Clear(); belt.Clear(); toJar.Clear();
+        fadingJars.Clear(); motes.Clear(); floaters.Clear();
         boardRoot = hudRoot = pieceRoot = null;
+        energyPanel = null;
         finished = false;
         deepestBroken = -1;
         scrollY = scrollTarget = 0f;
@@ -230,6 +271,35 @@ public class MarbleDown : MonoBehaviour
     void MakeBlank()
     {
         blankSprite = Sprite.Create(Texture2D.whiteTexture, new Rect(0f, 0f, 1f, 1f), new Vector2(0.5f, 0.5f), 1f);
+        roundedSprite = MakeRoundedSprite(64, 0.22f);
+    }
+
+    // A rounded square, drawn in code so the corner radius is ours to pick and no
+    // extra asset has to exist. Used for cells the player has dug out: they are
+    // floor you can see, not the void a missing cell leaves behind.
+    Sprite MakeRoundedSprite(int size, float cornerFraction)
+    {
+        var tex = new Texture2D(size, size, TextureFormat.RGBA32, false)
+        {
+            filterMode = FilterMode.Bilinear,
+            wrapMode = TextureWrapMode.Clamp,
+        };
+        float radius = size * cornerFraction;
+        var px = new Color[size * size];
+
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+            {
+                float px0 = x + 0.5f, py0 = y + 0.5f;
+                float dx = Mathf.Max(radius - px0, px0 - (size - radius), 0f);
+                float dy = Mathf.Max(radius - py0, py0 - (size - radius), 0f);
+                float d = Mathf.Sqrt(dx * dx + dy * dy);
+                px[y * size + x] = new Color(1f, 1f, 1f, Mathf.Clamp01(radius - d + 0.5f));
+            }
+
+        tex.SetPixels(px);
+        tex.Apply();
+        return Sprite.Create(tex, new Rect(0f, 0f, size, size), new Vector2(0.5f, 0.5f), size);
     }
 
     void ComputeLayout()
@@ -264,10 +334,36 @@ public class MarbleDown : MonoBehaviour
                 for (int c = 0; c < boardWidth; c++)
                     board[c, r] = MakeCell(c, r);
 
-            if (PathExists()) { PlaceIce(); return; }
+            if (PathExists()) { PlaceJarCells(); PlaceIce(); return; }
         }
         CarveEscape();                                   // pathological seed: cut one clean column
+        PlaceJarCells();
         PlaceIce();
+    }
+
+    // A fixed budget of jar cells per level rather than a per-cell chance, so the
+    // fourth slot is a rare, findable thing instead of random weather.
+    void PlaceJarCells()
+    {
+        var spots = new List<Vector2Int>();
+        for (int r = plainTopRows; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+                if (board[c, r].kind == Kind.Block) spots.Add(new Vector2Int(c, r));
+
+        for (int i = spots.Count - 1; i > 0; i--)
+        {
+            int j = Random.Range(0, i + 1);
+            (spots[i], spots[j]) = (spots[j], spots[i]);
+        }
+
+        int placed = Mathf.Min(jarCellsPerLevel, spots.Count);
+        for (int i = 0; i < placed; i++)
+        {
+            var cell = board[spots[i].x, spots[i].y];
+            cell.kind = Kind.JarCell;
+            cell.nest.Clear();
+            cell.color = RandomColor();
+        }
     }
 
     // Ice melts only once two neighbours have been broken, so it may only sit
@@ -279,9 +375,9 @@ public class MarbleDown : MonoBehaviour
             for (int c = 0; c < boardWidth; c++)
             {
                 var cell = board[c, r];
-                if (cell.kind != Kind.Block || cell.ice) continue;
+                if (cell.kind != Kind.Block || cell.ice || cell.color == STONE) continue;
                 if (Random.value >= iceChance) continue;
-                if (FreeNeighbours(c, r) >= 2) cell.ice = true;
+                if (OpenableNeighbours(c, r) >= 2) cell.ice = true;
             }
 
         // Placing ice steals a free neighbour from whoever was iced earlier, so
@@ -295,20 +391,22 @@ public class MarbleDown : MonoBehaviour
                 for (int c = 0; c < boardWidth; c++)
                 {
                     var cell = board[c, r];
-                    if (!cell.ice || FreeNeighbours(c, r) >= 2) continue;
+                    if (!cell.ice || OpenableNeighbours(c, r) >= 2) continue;
                     cell.ice = false;
                     changed = true;
                 }
         }
     }
 
-    int FreeNeighbours(int c, int r)
+    // Only the sides and the cell above count. Ice reachable solely from above and
+    // below has to be attacked from a side that isn't there, which kept locking
+    // boards up: you dig past it and can never come back at it.
+    int OpenableNeighbours(int c, int r)
     {
         int n = 0;
         if (Breakable(c - 1, r)) n++;
         if (Breakable(c + 1, r)) n++;
         if (Breakable(c, r - 1)) n++;
-        if (Breakable(c, r + 1)) n++;
         return n;
     }
 
@@ -336,13 +434,18 @@ public class MarbleDown : MonoBehaviour
         if (roll < energyChance)
         {
             cell.kind = Kind.Energy;
-            cell.bonus = RollBonus();
             return cell;
         }
-        roll -= energyChance;
-        if (roll < jarCellChance) { cell.kind = Kind.JarCell; return cell; }
-
-        if (Random.value < doubleChance) cell.inner = RandomColor();
+        if (Random.value < crustChance)
+        {
+            cell.nest.Add(cell.color);      // the real block hides under the shell
+            cell.color = STONE;
+        }
+        else if (Random.value < doubleChance)
+        {
+            cell.nest.Add(RandomColor());
+            if (Random.value < tripleChance) cell.nest.Add(RandomColor());
+        }
         return cell;
     }
 
@@ -389,14 +492,6 @@ public class MarbleDown : MonoBehaviour
 
     int RandomColor() => Random.Range(0, Mathf.Min(BLOCK_COLORS.Length, blockSprites.Length));
 
-    int RollBonus()
-    {
-        int roll = Random.Range(0, 15);
-        if (roll < 8) return 1;
-        if (roll < 12) return 2;
-        return roll < 14 ? 3 : 4;
-    }
-
     // ---- board visuals ----------------------------------------------------
 
     void BuildBoardVisuals()
@@ -417,12 +512,18 @@ public class MarbleDown : MonoBehaviour
         cell.root.SetParent(boardRoot, false);
         cell.root.localPosition = CellLocalPos(cell.col, cell.row);
 
+        // the tile under everything: a cell that exists always shows floor, so the
+        // shape of the shaft reads even where the contents are still hidden
+        cell.floor = MakeSprite(cell.root, "Floor", roundedSprite, Z_FLOOR);
+        FitSprite(cell.floor, roundedSprite, cellSize * 0.94f, cellSize * 0.94f);
+        cell.floor.color = OPEN_TILE;
+
         cell.body = MakeSprite(cell.root, "Body", null, Z_BODY);
         cell.innerBody = MakeSprite(cell.root, "Inner", null, Z_INNER);
+        cell.innerBody2 = MakeSprite(cell.root, "Inner2", null, Z_INNER2);
         cell.icon = MakeSprite(cell.root, "Icon", null, Z_ICON);
         cell.iceLayer = MakeSprite(cell.root, "Ice", iceSprite, Z_ICE);
         cell.fog = MakeSprite(cell.root, "Fog", fogSprite, Z_FOG);
-        cell.label = MakeText(cell.root, "Label", Vector3.zero, Z_CELL_TEXT, cellSize * 0.055f);
     }
 
     void BuildDoor()
@@ -494,12 +595,14 @@ public class MarbleDown : MonoBehaviour
         hudRoot.SetParent(transform, false);
 
         // opaque band so rows scrolling up slide behind the jars instead of over them
+        // down to boardTopY, not windowTop: the gap between them was exactly where
+        // the row you already dug through stayed visible as a sliver
         var band = MakeSprite(hudRoot, "HudBand", blankSprite, Z_HUD_BG);
-        band.transform.localPosition = new Vector3(0f, (halfH + windowTop) * 0.5f, 0f);
-        FitSprite(band, blankSprite, halfW * 2f, halfH - windowTop);
+        band.transform.localPosition = new Vector3(0f, (halfH + boardTopY) * 0.5f, 0f);
+        FitSprite(band, blankSprite, halfW * 2f, halfH - boardTopY);
         band.color = BG_COLOR;
 
-        var shelf = MakeSprite(hudRoot, "Shelf", blankSprite, Z_HUD_BG + 1);
+        var shelf = MakeSprite(hudRoot, "Shelf", blankSprite, Z_HUD_PANEL);
         shelf.transform.localPosition = new Vector3(0f, 0.735f * halfH, 0f);
         FitSprite(shelf, blankSprite, halfW * 1.45f, 0.07f * halfH);
         shelf.color = HUD_SHELF;
@@ -513,14 +616,14 @@ public class MarbleDown : MonoBehaviour
     // The belt is a stadium loop: two straight runs joined by half-circle caps.
     void BuildBeltVisual()
     {
-        var bar = MakeSprite(hudRoot, "Belt", blankSprite, Z_HUD_BG + 1);
+        var bar = MakeSprite(hudRoot, "Belt", blankSprite, Z_HUD_PANEL);
         bar.transform.localPosition = beltCenter;
         FitSprite(bar, blankSprite, beltHalfLen * 2f, beltRadius * 2.55f);
         bar.color = BELT_COLOR;
 
         for (int side = -1; side <= 1; side += 2)
         {
-            var cap = MakeSprite(hudRoot, "BeltCap" + side, blankSprite, Z_HUD_BG + 1);
+            var cap = MakeSprite(hudRoot, "BeltCap" + side, blankSprite, Z_HUD_PANEL);
             cap.transform.localPosition = beltCenter + new Vector3(side * beltHalfLen, 0f, 0f);
             FitSprite(cap, blankSprite, beltRadius * 1.6f, beltRadius * 2.55f);
             cap.color = BELT_COLOR;
@@ -530,33 +633,41 @@ public class MarbleDown : MonoBehaviour
     void BuildEnergyVisual()
     {
         float y = 0.38f * halfH;
-        var panel = MakeSprite(hudRoot, "EnergyPanel", blankSprite, Z_HUD_BG + 1);
-        panel.transform.localPosition = new Vector3(0f, y, 0f);
-        FitSprite(panel, blankSprite, halfW * 0.44f, 0.085f * halfH);
-        panel.color = ENERGY_PANEL;
+        energyPanel = MakeSprite(hudRoot, "EnergyPanel", blankSprite, Z_HUD_PANEL);
+        energyPanel.transform.localPosition = new Vector3(0f, y, 0f);
+        FitSprite(energyPanel, blankSprite, halfW * 0.44f, 0.085f * halfH);
+        energyPanel.color = ENERGY_PANEL;
 
-        var bolt = MakeSprite(hudRoot, "EnergyIcon", energySprite, Z_HUD);
+        // same sorting order as the panel meant the panel could cover it
+        var bolt = MakeSprite(hudRoot, "EnergyIcon", energySprite, Z_HUD_TOP);
         bolt.transform.localPosition = new Vector3(-halfW * 0.11f, y, 0f);
-        FitSprite(bolt, energySprite, 0.065f * halfH, 0.065f * halfH);
+        FitSprite(bolt, energySprite, 0.075f * halfH, 0.075f * halfH);
+        energyIconPos = bolt.transform.localPosition;
 
-        energyText = MakeText(hudRoot, "EnergyText", new Vector3(halfW * 0.05f, y, 0f), Z_HUD_TEXT, halfH * 0.024f);
-        energyText.color = new Color(0.10f, 0.35f, 0.10f);
+        energyText = MakeText(hudRoot, "EnergyText", new Vector3(halfW * 0.05f, y, 0f), Z_HUD_TEXT, halfH * 0.019f);
+        energyText.color = ENERGY_DIGITS;
     }
 
     // ---- jars -------------------------------------------------------------
 
     void AddJar(bool bonus)
     {
-        var jar = new Jar { color = PickJarColor(), bonus = bonus };
+        var jar = new Jar
+        {
+            color = PickJarColor(),
+            capacity = Random.Range(Mathf.Min(jarCapacityMin, jarCapacityMax), Mathf.Max(jarCapacityMin, jarCapacityMax) + 1),
+            bonus = bonus,
+        };
         jar.root = new GameObject(bonus ? "BonusJar" : "Jar").transform;
         jar.root.SetParent(hudRoot, false);
 
-        jar.frame = MakeSprite(jar.root, "Frame", blankSprite, Z_HUD_BG + 2);
+        jar.frame = MakeSprite(jar.root, "Frame", roundedSprite, Z_JAR_FRAME);
         jar.frame.color = BONUS_JAR;
         jar.glass = MakeSprite(jar.root, "Glass", jarSprite, Z_HUD);
-        jar.lid = MakeSprite(jar.root, "Lid", blankSprite, Z_HUD + 1);
+        jar.lid = MakeSprite(jar.root, "Lid", blankSprite, Z_HUD_TOP);
         jar.text = MakeText(jar.root, "Count", Vector3.zero, Z_HUD_TEXT, halfH * 0.018f);
 
+        jar.root.localScale = Vector3.one * 0.2f;      // grows in via UpdateFeel
         jars.Add(jar);
         LayoutJars();
     }
@@ -574,7 +685,7 @@ public class MarbleDown : MonoBehaviour
             jar.root.localPosition = new Vector3(x0 + i * step, y, 0f);
 
             FitSprite(jar.glass, jarSprite, w * 0.82f, w * 0.90f);
-            FitSprite(jar.frame, blankSprite, w * 1.02f, w * 1.12f);
+            FitSprite(jar.frame, roundedSprite, w * 1.10f, w * 1.20f);
             FitSprite(jar.lid, blankSprite, w * 0.74f, w * 0.24f);
             jar.lid.transform.localPosition = new Vector3(0f, w * 0.38f, 0f);
             jar.text.transform.localPosition = new Vector3(0f, w * 0.38f, 0f);
@@ -583,59 +694,129 @@ public class MarbleDown : MonoBehaviour
         RefreshJars();
     }
 
-    // Jars ask for what the shaft can actually pay: whatever is stuck on the belt
-    // first, then whatever colors are still buried.
-    int PickJarColor()
-    {
-        int n = Mathf.Min(BLOCK_COLORS.Length, blockSprites.Length);
-        var weight = new float[n];
-        foreach (var p in belt) weight[p.color] += 3f;
-
-        for (int r = 0; r < boardHeight; r++)
-            for (int c = 0; c < boardWidth; c++)
-            {
-                var cell = board[c, r];
-                if (cell.broken || cell.kind != Kind.Block) continue;
-                weight[cell.color] += 1f;
-                if (cell.inner >= 0) weight[cell.inner] += 1f;
-            }
-
-        float total = 0f;
-        foreach (float w in weight) total += w;
-        if (total <= 0f) return Random.Range(0, n);
-
-        float roll = Random.value * total;
-        for (int i = 0; i < n; i++)
-        {
-            roll -= weight[i];
-            if (roll <= 0f) return i;
-        }
-        return n - 1;
-    }
+    // Flat random. The jar used to be weighted towards what was stuck on the belt
+    // and what was still buried, which quietly refunded every wrong dig — pieces
+    // nobody wanted always got a matching jar eventually. Straight random means a
+    // wrong colour is a real loss.
+    int PickJarColor() => Random.Range(0, Mathf.Min(BLOCK_COLORS.Length, blockSprites.Length));
 
     void RefreshJars()
     {
         foreach (var jar in jars)
         {
+            // tint the whole jar, not just the lid — a thin coloured strip was
+            // not enough to tell what the jar is asking for
             jar.lid.color = BLOCK_COLORS[jar.color];
+            jar.glass.color = Color.Lerp(BLOCK_COLORS[jar.color], Color.white, 0.35f);
             jar.frame.enabled = jar.bonus;
-            jar.text.text = (jarCapacity - jar.filled).ToString();
+            jar.text.text = (jar.capacity - jar.filled).ToString();
             jar.text.color = new Color(0.15f, 0.05f, 0.10f);
         }
     }
 
+    // The energy is not credited here — it flies to the counter and is added as
+    // each mote lands, so the number climbing matches what the eye is following.
     void CompleteJar(Jar jar)
     {
-        energy += Mathf.Max(0, jarReward);
         bool wasBonus = jar.bonus;
         jars.Remove(jar);
-        Destroy(jar.root.gameObject);
+        SpawnMotes(jar.root.position, jar.capacity);
+        fadingJars.Add(new Fading { root = jar.root, t = 0f });
 
         if (!wasBonus) AddJar(false);      // permanent slots refill; the bonus one is spent
         else LayoutJars();
 
         RefreshHud();
         AssignPieces();
+    }
+
+    // What a click just cost or paid, rising off the cell it happened on.
+    void SpawnFloater(Vector3 worldPos, string text, Color color)
+    {
+        var tm = MakeText(transform, "Floater", Vector3.zero, Z_HUD_TEXT + 2, cellSize * 0.075f);
+        tm.transform.position = worldPos;
+        tm.text = text;
+        tm.color = color;
+        floaters.Add(new Floater { tm = tm, from = worldPos, t = 0f });
+    }
+
+    void SpawnMotes(Vector3 from, int count)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            var go = new GameObject("EnergyMote");
+            go.transform.SetParent(hudRoot, false);
+            var sr = go.AddComponent<SpriteRenderer>();
+            sr.sprite = energySprite;
+            sr.sortingOrder = Z_HUD_TEXT + 1;   // motes fly over everything
+            FitSprite(sr, energySprite, 0.05f * halfH, 0.05f * halfH);
+
+            var m = new Mote { sr = sr, t = -0.09f * i };      // stagger so they read as several
+            m.from = from + (Vector3)(Random.insideUnitCircle * 0.04f * halfH);
+            m.pos = m.from;
+            go.transform.position = m.pos;
+            motes.Add(m);
+        }
+    }
+
+    void UpdateFeel(float dt)
+    {
+        for (int i = 0; i < jars.Count; i++)
+        {
+            var jar = jars[i];
+            if (jar.appear >= 1f) continue;
+            jar.appear = Mathf.Min(1f, jar.appear + dt / Mathf.Max(0.05f, jarSwapTime));
+            jar.root.localScale = Vector3.one * Mathf.SmoothStep(0.2f, 1f, jar.appear);
+        }
+
+        // the answer changes as pieces land, so it is asked every frame now
+        CheckLoss();
+        RefreshEnergyColor();
+
+        for (int i = fadingJars.Count - 1; i >= 0; i--)
+        {
+            var f = fadingJars[i];
+            f.t += dt / Mathf.Max(0.05f, jarSwapTime);
+            if (f.root != null) f.root.localScale = Vector3.one * Mathf.SmoothStep(1f, 0f, f.t);
+            if (f.t < 1f) continue;
+            if (f.root != null) Destroy(f.root.gameObject);
+            fadingJars.RemoveAt(i);
+        }
+
+        for (int i = floaters.Count - 1; i >= 0; i--)
+        {
+            var f = floaters[i];
+            f.t += dt / Mathf.Max(0.05f, floaterTime);
+            if (f.tm == null) { floaters.RemoveAt(i); continue; }
+
+            f.tm.transform.position = f.from + Vector3.up * (cellSize * 0.8f * Mathf.SmoothStep(0f, 1f, f.t));
+            var c = f.tm.color;
+            c.a = 1f - Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.4f, 1f, f.t));
+            f.tm.color = c;
+
+            if (f.t < 1f) continue;
+            Destroy(f.tm.gameObject);
+            floaters.RemoveAt(i);
+        }
+
+        Vector3 target = hudRoot != null ? hudRoot.TransformPoint(energyIconPos) : Vector3.zero;
+        for (int i = motes.Count - 1; i >= 0; i--)
+        {
+            var m = motes[i];
+            m.t += dt / Mathf.Max(0.05f, moteTime);
+            if (m.t < 0f) { m.sr.enabled = false; continue; }
+            m.sr.enabled = true;
+
+            float e = 1f - (1f - Mathf.Clamp01(m.t)) * (1f - Mathf.Clamp01(m.t));
+            m.pos = Vector3.Lerp(m.from, target, e);
+            m.sr.transform.position = m.pos;
+
+            if (m.t < 1f) continue;
+            Destroy(m.sr.gameObject);
+            motes.RemoveAt(i);
+            energy++;
+            RefreshHud();
+        }
     }
 
     // ---- pieces & belt ----------------------------------------------------
@@ -673,7 +854,7 @@ public class MarbleDown : MonoBehaviour
     {
         foreach (var jar in jars)
         {
-            int need = jarCapacity - jar.filled - jar.incoming;
+            int need = jar.capacity - jar.filled - jar.incoming;
             for (int k = 0; k < need; k++)
             {
                 int idx = -1;
@@ -767,7 +948,7 @@ public class MarbleDown : MonoBehaviour
             jar.incoming--;
             jar.filled++;
             RefreshJars();
-            if (jar.filled >= jarCapacity) CompleteJar(jar);
+            if (jar.filled >= jar.capacity) CompleteJar(jar);
         }
 
         AssignPieces();
@@ -779,6 +960,7 @@ public class MarbleDown : MonoBehaviour
     {
         HandleInput();
         UpdatePieces(Time.deltaTime);
+        UpdateFeel(Time.deltaTime);
         ScrollBoard();
     }
 
@@ -806,6 +988,9 @@ public class MarbleDown : MonoBehaviour
 
         if (row == boardHeight) { TryExit(); return; }
         if (col < 0 || col >= boardWidth || row < 0 || row >= boardHeight) return;
+
+        // ignore anything still tucked under the HUD, including mid-scroll
+        if (boardTopY - row * cellSize + scrollY > windowTop + 0.001f) return;
         TryBreak(board[col, row]);
     }
 
@@ -826,13 +1011,23 @@ public class MarbleDown : MonoBehaviour
 
     // ---- breaking ---------------------------------------------------------
 
-    bool Clickable(Cell cell)
+    // Touching the dug-out area. Iced cells count: they are part of the front even
+    // though they cannot be clicked yet, and dimming them made them look broken.
+    bool Reachable(Cell cell)
     {
         if (cell.broken || cell.kind == Kind.Missing) return false;
-        if (cell.ice && cell.freedNeighbours < 2) return false;
         if (cell.row == 0) return true;                  // the entrance is always open
         return IsBroken(cell.col - 1, cell.row) || IsBroken(cell.col + 1, cell.row)
             || IsBroken(cell.col, cell.row - 1) || IsBroken(cell.col, cell.row + 1);
+    }
+
+    // Both bonus cells are gifts, so neither charges for the click.
+    bool IsFree(Cell cell) => cell.kind == Kind.Energy || cell.kind == Kind.JarCell;
+
+    bool Clickable(Cell cell)
+    {
+        if (!Reachable(cell)) return false;
+        return !cell.ice || cell.freedNeighbours >= 2;
     }
 
     bool IsBroken(int c, int r)
@@ -845,14 +1040,19 @@ public class MarbleDown : MonoBehaviour
     {
         if (!Clickable(cell)) return;
 
-        bool free = cell.kind == Kind.Energy;             // energy cells pay, they don't charge
+        bool free = IsFree(cell);
         if (!free && energy <= 0) return;
         if (!free) energy--;
+
+        // only say something when the energy actually moved: a jar cell is a gift,
+        // and the new slot appearing in the HUD is its own receipt
+        if (cell.kind == Kind.Energy) SpawnFloater(cell.root.position, "+1", GAIN_TEXT);
+        else if (!free) SpawnFloater(cell.root.position, "-1", COST_TEXT);
 
         switch (cell.kind)
         {
             case Kind.Energy:
-                energy += cell.bonus;
+                energy++;
                 cell.broken = true;
                 break;
 
@@ -862,18 +1062,15 @@ public class MarbleDown : MonoBehaviour
                 break;
 
             default:
-                if (cell.inner >= 0)
+                // chipping the shell off a petrified block gives you nothing
+                if (cell.color != STONE) SpawnPieces(cell, cell.color, piecesPerBlock);
+                if (cell.nest.Count > 0)
                 {
-                    // strip the shell; the inner block spreads to full size and stays
-                    SpawnPieces(cell, cell.color, piecesPerBlock);
-                    cell.color = cell.inner;
-                    cell.inner = -1;
+                    // strip one shell; the next layer spreads to full size and stays
+                    cell.color = cell.nest[0];
+                    cell.nest.RemoveAt(0);
                 }
-                else
-                {
-                    SpawnPieces(cell, cell.color, piecesPerBlock);
-                    cell.broken = true;
-                }
+                else cell.broken = true;
                 break;
         }
 
@@ -904,15 +1101,54 @@ public class MarbleDown : MonoBehaviour
     // in reach — clicking one of those costs nothing.
     void CheckLoss()
     {
-        if (finished || energy > 0) return;
+        if (finished) return;
 
-        for (int r = 0; r < boardHeight; r++)
-            for (int c = 0; c < boardWidth; c++)
-                if (board[c, r].kind == Kind.Energy && Clickable(board[c, r])) return;
+        // Walled in by holes with the door still shut. Without this the game just
+        // stops responding and never says why.
+        if (!DoorOpen() && !AnyClickable(false))
+        {
+            finished = true;
+            statusText.text = "DEAD END";
+            statusText.color = new Color(1f, 0.55f, 0.35f);
+            return;
+        }
+
+        if (energy > 0) return;
+        if (EnergyPending()) return;                     // the jars have not finished paying
+        if (AnyClickable(true)) return;                  // a free bonus cell is still in reach
 
         finished = true;
         statusText.text = "OUT OF ENERGY";
         statusText.color = new Color(1f, 0.45f, 0.45f);
+    }
+
+    // Anything still owed: pieces in the air, energy in the air, or a jar the belt
+    // can already finish. Declaring a loss before all that settles was calling the
+    // game over while the payout was literally still flying across the screen.
+    bool EnergyPending()
+    {
+        if (motes.Count > 0 || toJar.Count > 0) return true;
+
+        foreach (var jar in jars)
+        {
+            int onBelt = 0;
+            foreach (var piece in belt)
+                if (piece.color == jar.color) onBelt++;
+            if (jar.filled + jar.incoming + onBelt >= jar.capacity) return true;
+        }
+        return false;
+    }
+
+    bool AnyClickable(bool freeOnly)
+    {
+        for (int r = 0; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+            {
+                var cell = board[c, r];
+                if (freeOnly && !IsFree(cell)) continue;
+                if (Clickable(cell)) return true;
+            }
+        return false;
     }
 
     // ---- refresh ----------------------------------------------------------
@@ -930,32 +1166,43 @@ public class MarbleDown : MonoBehaviour
         doorText.text = open ? "EXIT" : "";
         doorText.color = new Color(0.1f, 0.25f, 0.1f);
 
-        scrollTarget = ScrollFor(deepestBroken + 3);
+        scrollTarget = ScrollFor(deepestBroken + scrollLead);
     }
 
     static readonly Color DIM = new Color(0.42f, 0.36f, 0.44f, 1f);
 
     void RefreshCell(Cell cell, int distance)
     {
-        Color tint = Clickable(cell) ? Color.white : DIM;
-
-        // a hole is drawn as nothing at all — the background is the abyss
-        if (cell.broken || cell.kind == Kind.Missing)
+        // a hole really is nothing: no floor either, the background is the abyss
+        if (cell.kind == Kind.Missing)
         {
-            cell.body.enabled = cell.innerBody.enabled = cell.icon.enabled = false;
-            cell.iceLayer.enabled = cell.fog.enabled = false;
-            cell.label.text = "";
+            cell.floor.enabled = false;
+            cell.body.enabled = cell.innerBody.enabled = cell.innerBody2.enabled = false;
+            cell.icon.enabled = cell.iceLayer.enabled = cell.fog.enabled = false;
             return;
         }
+
+        // Every real cell keeps its tile whatever else is going on — dug out, still
+        // buried, or hidden behind a question mark. That is what makes the shaft
+        // read as a board instead of a few floating blocks.
+        cell.floor.enabled = true;
+
+        if (cell.broken)
+        {
+            cell.body.enabled = cell.innerBody.enabled = cell.innerBody2.enabled = false;
+            cell.icon.enabled = cell.iceLayer.enabled = cell.fog.enabled = false;
+            return;
+        }
+
+        Color tint = Reachable(cell) ? Color.white : DIM;
 
         bool hidden = distance > revealRadius;
         cell.fog.enabled = hidden;
         cell.fog.color = tint;
         if (hidden)
         {
-            cell.body.enabled = cell.innerBody.enabled = cell.icon.enabled = false;
-            cell.iceLayer.enabled = false;
-            cell.label.text = "";
+            cell.body.enabled = cell.innerBody.enabled = cell.innerBody2.enabled = false;
+            cell.icon.enabled = cell.iceLayer.enabled = false;
             return;
         }
 
@@ -963,18 +1210,16 @@ public class MarbleDown : MonoBehaviour
         cell.body.enabled = isBlock;
         if (isBlock)
         {
-            cell.body.sprite = blockSprites[cell.color];
+            // a stone shell reuses the grey square, with the real block showing
+            // through inside it — same read as a double, so it is obvious that it
+            // takes one click to crack and a second one to collect
+            cell.body.sprite = cell.color == STONE ? fogSprite : blockSprites[cell.color];
             cell.body.color = tint;
             FitSprite(cell.body, cell.body.sprite, cellSize, cellSize);
         }
 
-        cell.innerBody.enabled = isBlock && cell.inner >= 0;
-        if (cell.innerBody.enabled)
-        {
-            cell.innerBody.sprite = blockSprites[cell.inner];
-            cell.innerBody.color = tint;
-            FitSprite(cell.innerBody, cell.innerBody.sprite, cellSize * 0.62f, cellSize * 0.62f);
-        }
+        DrawNested(cell.innerBody, cell, 0, cellSize * 0.62f, tint);
+        DrawNested(cell.innerBody2, cell, 1, cellSize * 0.34f, tint);
 
         cell.icon.enabled = !isBlock;
         if (cell.icon.enabled)
@@ -987,16 +1232,25 @@ public class MarbleDown : MonoBehaviour
         cell.iceLayer.enabled = cell.ice;
         if (cell.ice)
         {
-            FitSprite(cell.iceLayer, iceSprite, cellSize, cellSize);
-            // one neighbour down: the ice thins out, one more break and it's gone
-            var ice = cell.freedNeighbours >= 1 ? new Color(1f, 1f, 1f, 0.55f) : Color.white;
-            cell.iceLayer.color = ice * tint;
+            // the cracked sprite says "one more neighbour" better than a digit did
+            var sprite = cell.freedNeighbours >= 1 && iceCrackedSprite != null ? iceCrackedSprite : iceSprite;
+            cell.iceLayer.sprite = sprite;
+            FitSprite(cell.iceLayer, sprite, cellSize, cellSize);
+            cell.iceLayer.color = tint;
         }
 
-        cell.label.text = cell.ice ? (2 - cell.freedNeighbours).ToString()
-                        : cell.kind == Kind.Energy ? "+" + cell.bonus
-                        : "";
-        cell.label.color = cell.ice ? new Color(0.10f, 0.30f, 0.45f) : new Color(0.35f, 0.20f, 0f);
+    }
+
+    // One buried layer of a double / triple cell, drawn smaller inside the last one.
+    void DrawNested(SpriteRenderer sr, Cell cell, int index, float size, Color tint)
+    {
+        bool show = cell.kind == Kind.Block && cell.nest.Count > index;
+        sr.enabled = show;
+        if (!show) return;
+
+        sr.sprite = blockSprites[cell.nest[index]];
+        sr.color = tint;
+        FitSprite(sr, sr.sprite, size, size);
     }
 
     // Chebyshev distance to the nearest broken cell, with the entrance row counted
@@ -1034,9 +1288,27 @@ public class MarbleDown : MonoBehaviour
         return dist;
     }
 
+    // The whole panel carries the warning: green while you are fine, yellow at
+    // three, flashing red at two or less. The digit itself stays dark so it keeps
+    // reading against all three.
+    void RefreshEnergyColor()
+    {
+        if (energyPanel == null) return;
+
+        if (energy <= 2)
+        {
+            float pulse = 0.5f + 0.5f * Mathf.Sin(Time.time * 9f);
+            energyPanel.color = Color.Lerp(ENERGY_LOW, ENERGY_LOW_FLASH, pulse);
+        }
+        else energyPanel.color = energy == 3 ? ENERGY_WARN : ENERGY_PANEL;
+
+        if (energyText != null) energyText.color = ENERGY_DIGITS;
+    }
+
     void RefreshHud()
     {
         energyText.text = energy.ToString();
+        RefreshEnergyColor();
         RefreshJars();
     }
 
@@ -1048,9 +1320,11 @@ public class MarbleDown : MonoBehaviour
         float want = windowBottom + (boardTopY - windowBottom) * 0.5f;
         float offset = want - rowY;
 
+        // Snap to whole cells. A free-floating offset left the top row sliced in
+        // half under the HUD, and half a cell still invited a click.
         float lowest = boardTopY - (boardHeight + 1.5f) * cellSize;
-        float maxOffset = windowBottom - lowest;
-        return Mathf.Clamp(offset, 0f, Mathf.Max(0f, maxOffset));
+        float maxOffset = Mathf.Ceil(Mathf.Max(0f, windowBottom - lowest) / cellSize) * cellSize;
+        return Mathf.Clamp(Mathf.Round(offset / cellSize) * cellSize, 0f, maxOffset);
     }
 
     void ScrollBoard()

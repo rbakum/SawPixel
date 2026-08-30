@@ -240,23 +240,35 @@ MonoBehaviour:
   - {fileID: 21300000, guid: 7eeb3682048fd4e92b19e13ebb405a82, type: 3}
   - {fileID: 21300000, guid: a7fd1b927176242469db493824bc8f09, type: 3}
   iceSprite: {fileID: 21300000, guid: a5dcff0fac51b416da8a2d22146812f7, type: 3}
+  iceCrackedSprite: {fileID: 21300000, guid: 7f47e4fa9b5014afb8dadc8d4f329bd6, type: 3}
   fogSprite: {fileID: 21300000, guid: 1ec2b38dbb51c4b1c8defe71242d3329, type: 3}
   energySprite: {fileID: 21300000, guid: 4b707021b8db642efa2c13ad65a42b88, type: 3}
   jarSprite: {fileID: 21300000, guid: cf73d92ee13b849b892a88255d90b71b, type: 3}
   boardWidth: 5
   boardHeight: 25
-  visibleRows: 8
-  revealRadius: 2
+  visibleRows: 9
+  scrollLead: 1
+  revealRadius: 6
   startEnergy: 8
-  jarCapacity: 3
-  jarReward: 1
-  piecesPerBlock: 6
+  jarCapacityMin: 2
+  jarCapacityMax: 3
+  piecesPerBlock: 1
   jarSlots: 3
+  missingChance: 0.09
+  missingEdgeBias: 2.2
   doubleChance: 0.16
+  tripleChance: 0.1
+  crustChance: 0.08
   iceChance: 0.1
-  energyChance: 0.07
-  jarCellChance: 0.05
+  energyChance: 0.035
+  jarCellsPerLevel: 2
   plainTopRows: 2
+  beltSpeed: 0.07
+  flightTime: 0.45
+  beltDwell: 0.5
+  jarSwapTime: 0.28
+  moteTime: 0.55
+  floaterTime: 0.75
   useFixedSeed: 0
   seed: 0
 --- !u!4 &1184502417
