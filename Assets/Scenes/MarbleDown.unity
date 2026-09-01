@@ -250,6 +250,7 @@ MonoBehaviour:
   scrollLead: 1
   revealRadius: 6
   blockGap: 0.08
+  outlineWidth: 0.05
   startEnergy: 8
   jarCapacityMin: 2
   jarCapacityMax: 3

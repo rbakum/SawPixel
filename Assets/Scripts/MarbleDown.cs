@@ -44,6 +44,10 @@ public class MarbleDown : MonoBehaviour
     // an ABSOLUTE margin, not a scale: a 2x1 loses the same edge as a 1x1, or the
     // gap around long blocks would come out twice as wide.
     [Range(0f, 0.3f)] public float blockGap = 0.08f;
+    // White ring around anything the player may click this instant. Together with
+    // the light dimming it separates "on the front" from "actually clickable" —
+    // iced cells are lit but not outlined.
+    [Range(0f, 0.15f)] public float outlineWidth = 0.05f;
 
     [Header("Economy")]
     public int startEnergy = 8;
@@ -85,7 +89,13 @@ public class MarbleDown : MonoBehaviour
     public int seed;
 
     const float ORTHO_SIZE = 5f;
-    const int Z_FLOOR = -2, Z_BODY = 0, Z_INNER = 1, Z_INNER2 = 2, Z_ICON = 3, Z_ICE = 4, Z_FOG = 5, Z_CELL_TEXT = 6;
+    // Corner radius of the block art, as a fraction of a side. Fitted to the alpha
+    // contour of the four square sprites (9.5%..10.7%), NOT read off the first
+    // opaque pixel — that lands on the antialiased edge and under-reports it.
+    // The generated shapes must use the same figure or they will not line up.
+    const float BLOCK_CORNER = 0.103f;
+
+    const int Z_FLOOR = -2, Z_OUTLINE = -1, Z_BODY = 0, Z_INNER = 1, Z_INNER2 = 2, Z_ICON = 3, Z_ICE = 4, Z_FOG = 5, Z_CELL_TEXT = 6;
     // The jar frame used to sit ABOVE the glass, so a bonus jar was painted over
     // as a solid gold block and its real color was invisible.
     const int Z_HUD_BG = 20, Z_HUD_PANEL = 21, Z_JAR_FRAME = 22, Z_HUD = 23, Z_HUD_TOP = 24;
@@ -137,7 +147,7 @@ public class MarbleDown : MonoBehaviour
         public bool broken;
 
         public Transform root;
-        public SpriteRenderer floor, body, innerBody, innerBody2, icon, iceLayer, fog;
+        public SpriteRenderer floor, outline, body, innerBody, innerBody2, icon, iceLayer, fog;
     }
 
     class Jar
@@ -168,6 +178,9 @@ public class MarbleDown : MonoBehaviour
     Camera cam;
     Font uiFont;
     Sprite blankSprite;
+    Sprite roundedSprite;      // soft rounding, for HUD decoration
+    Sprite tileSprite;         // matches the block art's own corners
+    Sprite outlineSprite;      // those corners pushed outwards by the ring width
 
     Cell[,] board;
     readonly List<Jar> jars = new List<Jar>();
@@ -182,7 +195,6 @@ public class MarbleDown : MonoBehaviour
     readonly List<Mote> motes = new List<Mote>();
     readonly List<Floater> floaters = new List<Floater>();
     Vector3 energyIconPos;
-    Sprite roundedSprite;
 
     SpriteRenderer door;
     TextMesh doorText, energyText, statusText;
@@ -242,6 +254,7 @@ public class MarbleDown : MonoBehaviour
         MakeBlank();
         LoadFont();
         ComputeLayout();
+        MakeShapes();
         GenerateBoard();
         BuildBoardVisuals();
         BuildHud();
@@ -281,6 +294,20 @@ public class MarbleDown : MonoBehaviour
     {
         blankSprite = Sprite.Create(Texture2D.whiteTexture, new Rect(0f, 0f, 1f, 1f), new Vector2(0.5f, 0.5f), 1f);
         roundedSprite = MakeRoundedSprite(64, 0.22f);
+    }
+
+    // A ring around a block is the block's own outline pushed outwards, so its
+    // corner radius must GROW by the ring width — not scale with the sprite. A
+    // plain scaled-up rounded square is far too round at the corners and the
+    // block's squarer corner then covers it, leaving white only on the flats.
+    void MakeShapes()
+    {
+        float block = 1f - blockGap;                  // block size, in cell units
+        float pad = outlineWidth;                     // total growth, in cell units
+        float ring = (BLOCK_CORNER * block + pad * 0.5f) / (block + pad);
+
+        tileSprite = MakeRoundedSprite(128, BLOCK_CORNER);
+        outlineSprite = MakeRoundedSprite(128, ring);
     }
 
     // A rounded square, drawn in code so the corner radius is ours to pick and no
@@ -561,9 +588,13 @@ public class MarbleDown : MonoBehaviour
 
         // the tile under everything: a cell that exists always shows floor, so the
         // shape of the shaft reads even where the contents are still hidden
-        cell.floor = MakeSprite(cell.root, "Floor", roundedSprite, Z_FLOOR);
-        FitSprite(cell.floor, roundedSprite, BlockSize, BlockSize);
+        cell.floor = MakeSprite(cell.root, "Floor", tileSprite, Z_FLOOR);
+        FitSprite(cell.floor, tileSprite, BlockSize, BlockSize);
         cell.floor.color = OPEN_TILE;
+
+        cell.outline = MakeSprite(cell.root, "Outline", outlineSprite, Z_OUTLINE);
+        cell.outline.color = Color.white;
+        cell.outline.enabled = false;
 
         cell.body = MakeSprite(cell.root, "Body", null, Z_BODY);
         cell.innerBody = MakeSprite(cell.root, "Inner", null, Z_INNER);
@@ -1133,7 +1164,8 @@ public class MarbleDown : MonoBehaviour
                     var twin = cell.twin;
                     if (twin != null && !twin.broken)
                     {
-                        SpawnPieces(twin, twin.color, piecesPerBlock);   // the far half pays too
+                        // the far half clears but pays nothing: the reward for a 2x1
+                        // is ground covered, not income, or it prints energy
                         twin.broken = true;
                         Opened(twin);
                     }
@@ -1251,6 +1283,8 @@ public class MarbleDown : MonoBehaviour
     void RefreshCell(Cell cell, int distance)
     {
         // a hole really is nothing: no floor either, the background is the abyss
+        cell.outline.enabled = false;
+
         if (cell.kind == Kind.Missing)
         {
             cell.floor.enabled = false;
@@ -1294,10 +1328,13 @@ public class MarbleDown : MonoBehaviour
             // takes one click to crack and a second one to collect
             bool rock = cell.color == STONE && cell.nest.Count == 0;
             cell.body.sprite = cell.color != STONE ? blockSprites[cell.color]
-                             : rock ? roundedSprite      // solid slab, nothing inside
+                             : rock ? tileSprite         // solid slab, nothing inside
                                     : fogSprite;         // shell with a block under it
             cell.body.color = rock ? SOLID_ROCK * tint : tint;
             ShapeBody(cell);
+
+            if (Clickable(cell)) ShapeLike(cell.outline, cell, cellSize * outlineWidth);
+            cell.outline.enabled = Clickable(cell);
         }
 
         DrawNested(cell.innerBody, cell, 0, cellSize * 0.62f, tint);
@@ -1325,23 +1362,26 @@ public class MarbleDown : MonoBehaviour
 
     // A pair's head stretches over both cells and shifts half a cell towards its
     // partner, so the two read as one long block rather than two squares.
-    void ShapeBody(Cell cell)
+    void ShapeBody(Cell cell) => ShapeLike(cell.body, cell, 0f);
+
+    // Lay a renderer over the cell — or over both cells of a 2x1 — grown by `pad`.
+    void ShapeLike(SpriteRenderer sr, Cell cell, float pad)
     {
         var twin = cell.twin;
         if (twin == null || twin.broken || !cell.twinHead)
         {
-            cell.body.transform.localPosition = Vector3.zero;
-            FitSprite(cell.body, cell.body.sprite, BlockSize, BlockSize);
+            sr.transform.localPosition = Vector3.zero;
+            FitSprite(sr, sr.sprite, BlockSize + pad, BlockSize + pad);
             return;
         }
 
         bool sideways = twin.row == cell.row;
-        cell.body.transform.localPosition = sideways
+        sr.transform.localPosition = sideways
             ? new Vector3(cellSize * 0.5f, 0f, 0f)
             : new Vector3(0f, -cellSize * 0.5f, 0f);
-        FitSprite(cell.body, cell.body.sprite,
-            sideways ? PairSize : BlockSize,
-            sideways ? BlockSize : PairSize);
+        FitSprite(sr, sr.sprite,
+            (sideways ? PairSize : BlockSize) + pad,
+            (sideways ? BlockSize : PairSize) + pad);
     }
 
     // One buried layer of a double / triple cell, drawn smaller inside the last one.
