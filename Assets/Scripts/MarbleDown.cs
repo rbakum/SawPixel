@@ -37,7 +37,12 @@ public class MarbleDown : MonoBehaviour
     [Header("Board")]
     public int boardWidth = 5;
     public int boardHeight = 25;
-    public int visibleRows = 9;
+    public int visibleRows = 9;                // only a floor now; width decides the size
+    [Range(0.6f, 1f)] public float boardFill = 0.96f;   // share of the screen width the board takes
+    // Rows are shorter than they are wide. Square cells at full width left only
+    // 5.7 rows on screen; squashing them a little buys the rows back and, on
+    // polygons, is invisible.
+    [Range(0.6f, 1f)] public float rowSquash = 0.78f;
     public int scrollLead = 1;                 // rows kept below the dig before the board moves
     public int revealRadius = 6;
     // How much a block shrinks inside its cell, so neighbours don't touch. This is
@@ -48,6 +53,16 @@ public class MarbleDown : MonoBehaviour
     // the light dimming it separates "on the front" from "actually clickable" —
     // iced cells are lit but not outlined.
     [Range(0f, 0.15f)] public float outlineWidth = 0.05f;
+
+    [Header("Polygons")]
+    // Each cell gets the Voronoi region of a point jittered off its grid position,
+    // so the board keeps its 5x25 logic — neighbours, ice, fog, digging — while
+    // looking hand-cut. 0 gives back a plain grid.
+    [Range(0f, 0.45f)] public float polygonJitter = 0.40f;
+    // Jitter alone only moves stones around; they all come out the same size.
+    // Giving each site a weight pushes its borders outwards or inwards, so some
+    // crystals genuinely grow and others shrink — with straight edges either way.
+    [Range(0f, 0.6f)] public float sizeVariety = 0.30f;
 
     [Header("Economy")]
     public int startEnergy = 8;
@@ -66,8 +81,8 @@ public class MarbleDown : MonoBehaviour
     [Range(0f, 0.3f)] public float tripleChance = 0.10f;   // chance a double goes one layer deeper
     [Range(0f, 0.5f)] public float crustChance = 0.08f;    // block sealed under a stone shell
     [Range(0f, 0.3f)] public float rockChance = 0.03f;     // solid rock: one energy, nothing back
-    [Range(0f, 0.3f)] public float pairChance = 0.04f;     // 2x1 block: one click clears both halves
-    [Range(0f, 0.4f)] public float iceChance = 0.10f;
+    [Range(0f, 0.3f)] public float pairChance = 0.0f;      // parked: a 2x1 needs two polygons merged
+    [Range(0f, 0.4f)] public float iceChance = 0.0f;      // parked
     [Range(0f, 0.2f)] public float energyChance = 0.035f;
     public int jarCellsPerLevel = 2;           // exactly this many, placed after the board is rolled
     public int plainTopRows = 2;               // no specials this close to the entrance
@@ -113,6 +128,9 @@ public class MarbleDown : MonoBehaviour
     static readonly Color COST_TEXT = new Color(1f, 0.55f, 0.55f);
     static readonly Color GAIN_TEXT = new Color(0.65f, 1f, 0.45f);
     static readonly Color SOLID_ROCK = new Color(0.55f, 0.54f, 0.58f);
+    static readonly Color FOG_STONE = new Color(0.44f, 0.42f, 0.47f);
+    static readonly Color ICE_FRESH = new Color(0.55f, 0.85f, 1f, 0.85f);
+    static readonly Color ICE_CRACKED = new Color(0.72f, 0.93f, 1f, 0.55f);
     static readonly Color OPEN_TILE = new Color(0.52f, 0.09f, 0.27f);   // dug out, but still floor
     static readonly Color DOOR_LOCKED = new Color(0.35f, 0.10f, 0.22f);
     static readonly Color DOOR_OPEN = new Color(0.55f, 1f, 0.35f);
@@ -147,7 +165,11 @@ public class MarbleDown : MonoBehaviour
         public bool broken;
 
         public Transform root;
-        public SpriteRenderer floor, outline, body, innerBody, innerBody2, icon, iceLayer, fog;
+        public readonly List<Cell> neighbours = new List<Cell>();   // shares an edge with these
+        public Vector2[] shape;            // full region, local to the cell root; used for hit tests
+        public Vector2[] inner;            // the same shape pulled in by the gap; what gets drawn
+        public MeshRenderer floorMesh, outlineMesh, bodyMesh, iceMesh, nestMesh, nestMesh2;
+        public SpriteRenderer icon;
     }
 
     class Jar
@@ -177,6 +199,8 @@ public class MarbleDown : MonoBehaviour
 
     Camera cam;
     Font uiFont;
+    Material polyMaterial;
+    MaterialPropertyBlock polyBlock;
     Sprite blankSprite;
     Sprite roundedSprite;      // soft rounding, for HUD decoration
     Sprite tileSprite;         // matches the block art's own corners
@@ -200,7 +224,7 @@ public class MarbleDown : MonoBehaviour
     TextMesh doorText, energyText, statusText;
     SpriteRenderer energyPanel;
 
-    float halfW, halfH, cellSize;
+    float halfW, halfH, cellSize, cellH;
     float windowTop, windowBottom, boardTopY;
     float scrollY, scrollTarget;
 
@@ -294,6 +318,9 @@ public class MarbleDown : MonoBehaviour
     {
         blankSprite = Sprite.Create(Texture2D.whiteTexture, new Rect(0f, 0f, 1f, 1f), new Vector2(0.5f, 0.5f), 1f);
         roundedSprite = MakeRoundedSprite(64, 0.22f);
+
+        // every polygon shares this; the colour rides in a property block
+        polyMaterial = new Material(Shader.Find("Sprites/Default")) { mainTexture = Texture2D.whiteTexture };
     }
 
     // A ring around a block is the block's own outline pushed outwards, so its
@@ -347,9 +374,10 @@ public class MarbleDown : MonoBehaviour
         windowBottom = -0.99f * halfH;
         boardTopY = windowTop - 0.03f * halfH;          // breathing room under the HUD
 
-        float byWidth = 1.86f * halfW / Mathf.Max(1, boardWidth);
-        float byHeight = (boardTopY - windowBottom) / Mathf.Max(1, visibleRows);
-        cellSize = Mathf.Min(byWidth, byHeight);
+        // Size off the WIDTH: the board used to be capped by how many rows had to
+        // fit, which left a third of the screen empty on both sides.
+        cellSize = boardFill * 2f * halfW / Mathf.Max(1, boardWidth);
+        cellH = cellSize * rowSquash;
 
         beltCenter = new Vector3(0f, 0.55f * halfH, 0f);
         beltRadius = 0.055f * halfH;
@@ -573,6 +601,7 @@ public class MarbleDown : MonoBehaviour
         boardRoot = new GameObject("Board").transform;
         boardRoot.SetParent(transform, false);
 
+        BuildPolygons();
         for (int r = 0; r < boardHeight; r++)
             for (int c = 0; c < boardWidth; c++)
                 BuildCellVisual(board[c, r]);
@@ -580,29 +609,281 @@ public class MarbleDown : MonoBehaviour
         BuildDoor();
     }
 
+    // Every cell is the Voronoi region of a point nudged off its grid position.
+    // Grid neighbours stay grid neighbours, so nothing in the rules changes — only
+    // the shape does.
+    void BuildPolygons()
+    {
+        var sites = new Vector2[boardWidth, boardHeight];
+        var weights = new float[boardWidth, boardHeight];
+        for (int r = 0; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+            {
+                Vector3 home = CellLocalPos(c, r);
+                Vector2 offset = Random.insideUnitCircle * (Mathf.Min(cellSize, cellH) * polygonJitter);
+                sites[c, r] = new Vector2(home.x + offset.x, home.y + offset.y);
+
+                float grow = Random.Range(1f - sizeVariety, 1f + sizeVariety) * Mathf.Min(cellSize, cellH) * 0.5f;
+                weights[c, r] = grow * grow;
+            }
+
+        float half = boardWidth * cellSize * 0.5f;
+        float top = boardTopY, bottom = boardTopY - boardHeight * cellH;
+
+        for (int r = 0; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+            {
+                Vector2 site = sites[c, r];
+                var poly = new List<Vector2>
+                {
+                    new Vector2(-half, bottom), new Vector2(half, bottom),
+                    new Vector2(half, top), new Vector2(-half, top),
+                };
+
+                // clip against the bisector to every nearby site
+                for (int dr = -2; dr <= 2; dr++)
+                    for (int dc = -2; dc <= 2; dc++)
+                    {
+                        if (dr == 0 && dc == 0) continue;
+                        int nc = c + dc, nr = r + dr;
+                        if (nc < 0 || nc >= boardWidth || nr < 0 || nr >= boardHeight) continue;
+                        poly = ClipToNearer(poly, site, sites[nc, nr], weights[c, r], weights[nc, nr]);
+                        if (poly.Count < 3) break;
+                    }
+                if (poly.Count < 3) poly = SquareAround(site);
+
+                var cell = board[c, r];
+                cell.root = new GameObject("Cell" + c + "_" + r).transform;
+                cell.root.SetParent(boardRoot, false);
+                cell.root.localPosition = new Vector3(site.x, site.y, 0f);
+
+                cell.shape = new Vector2[poly.Count];
+                for (int i = 0; i < poly.Count; i++) cell.shape[i] = poly[i] - site;   // local to the root
+                cell.inner = Inset(cell.shape, cellSize * blockGap * 0.5f);
+            }
+
+        LinkNeighbours();
+    }
+
+    // Adjacency has to follow the polygons, not the grid underneath them. Two
+    // regions that share an edge are neighbours even when their grid positions are
+    // diagonal — otherwise a stone you are clearly touching refuses to open.
+    void LinkNeighbours()
+    {
+        float eps = cellSize * 0.02f;
+
+        for (int r = 0; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+            {
+                var cell = board[c, r];
+                cell.neighbours.Clear();
+
+                for (int dr = -2; dr <= 2; dr++)
+                    for (int dc = -2; dc <= 2; dc++)
+                    {
+                        if (dr == 0 && dc == 0) continue;
+                        int nc = c + dc, nr = r + dr;
+                        if (nc < 0 || nc >= boardWidth || nr < 0 || nr >= boardHeight) continue;
+
+                        var other = board[nc, nr];
+                        if (SharesEdge(cell, other, eps)) cell.neighbours.Add(other);
+                    }
+            }
+    }
+
+    // Voronoi regions that touch share two corners exactly, so counting matching
+    // vertices is enough — and it cannot be fooled by a corner-only contact.
+    bool SharesEdge(Cell a, Cell b, float eps)
+    {
+        Vector2 sa = a.root.localPosition, sb = b.root.localPosition;
+        int shared = 0;
+
+        foreach (var va in a.shape)
+            foreach (var vb in b.shape)
+                if (((va + sa) - (vb + sb)).sqrMagnitude <= eps * eps) { shared++; break; }
+
+        return shared >= 2;
+    }
+
+    List<Vector2> SquareAround(Vector2 site)
+    {
+        float h = cellSize * 0.45f;
+        return new List<Vector2>
+        {
+            new Vector2(site.x - h, site.y - h), new Vector2(site.x + h, site.y - h),
+            new Vector2(site.x + h, site.y + h), new Vector2(site.x - h, site.y + h),
+        };
+    }
+
+    // Sutherland-Hodgman against the border between the two sites. With equal
+    // weights this is the perpendicular bisector; a heavier site pushes the line
+    // away from itself, which is what makes its region larger.
+    List<Vector2> ClipToNearer(List<Vector2> poly, Vector2 keep, Vector2 other, float keepWeight, float otherWeight)
+    {
+        Vector2 normal = other - keep;
+        float limit = Vector2.Dot(normal, (keep + other) * 0.5f) + (keepWeight - otherWeight) * 0.5f;
+        var result = new List<Vector2>(poly.Count + 2);
+
+        for (int i = 0; i < poly.Count; i++)
+        {
+            Vector2 a = poly[i], b = poly[(i + 1) % poly.Count];
+            float da = Vector2.Dot(normal, a) - limit;
+            float db = Vector2.Dot(normal, b) - limit;
+
+            if (da <= 0f) result.Add(a);
+            if ((da < 0f && db > 0f) || (da > 0f && db < 0f))
+                result.Add(Vector2.Lerp(a, b, da / (da - db)));
+        }
+        return result;
+    }
+
+    // Push every edge inwards by `d` and re-intersect. A uniform inset is what
+    // makes the gaps read as even; scaling towards the centroid does not.
+    Vector2[] Inset(Vector2[] poly, float d)
+    {
+        int n = poly.Length;
+        if (n < 3 || d <= 0f) return (Vector2[])poly.Clone();
+
+        var result = new Vector2[n];
+        for (int i = 0; i < n; i++)
+        {
+            Vector2 prev = poly[(i - 1 + n) % n], cur = poly[i], next = poly[(i + 1) % n];
+            Vector2 n1 = InwardNormal(prev, cur), n2 = InwardNormal(cur, next);
+
+            Vector2 hit;
+            if (!LineCross(prev + n1 * d, cur + n1 * d, cur + n2 * d, next + n2 * d, out hit))
+                hit = cur + (n1 + n2).normalized * d;
+            result[i] = hit;
+        }
+        return Area(result) > Area(poly) * 0.15f ? result : Shrink(poly, 0.85f);
+    }
+
+    // polygons come out of the clipper wound counter-clockwise
+    static Vector2 InwardNormal(Vector2 a, Vector2 b)
+    {
+        Vector2 edge = b - a;
+        return new Vector2(-edge.y, edge.x).normalized;
+    }
+
+    static bool LineCross(Vector2 a1, Vector2 a2, Vector2 b1, Vector2 b2, out Vector2 hit)
+    {
+        Vector2 da = a2 - a1, db = b2 - b1;
+        float denom = da.x * db.y - da.y * db.x;
+        hit = Vector2.zero;
+        if (Mathf.Abs(denom) < 1e-6f) return false;
+        float t = ((b1.x - a1.x) * db.y - (b1.y - a1.y) * db.x) / denom;
+        hit = a1 + da * t;
+        return true;
+    }
+
+    static float Area(Vector2[] poly)
+    {
+        float sum = 0f;
+        for (int i = 0; i < poly.Length; i++)
+        {
+            Vector2 a = poly[i], b = poly[(i + 1) % poly.Length];
+            sum += a.x * b.y - b.x * a.y;
+        }
+        return Mathf.Abs(sum) * 0.5f;
+    }
+
+    static Vector2[] Shrink(Vector2[] poly, float k)
+    {
+        Vector2 mid = Vector2.zero;
+        foreach (var v in poly) mid += v;
+        mid /= poly.Length;
+
+        var result = new Vector2[poly.Length];
+        for (int i = 0; i < poly.Length; i++) result[i] = mid + (poly[i] - mid) * k;
+        return result;
+    }
+
+    static bool PointInPoly(Vector2 p, Vector2[] poly)
+    {
+        bool inside = false;
+        for (int i = 0, j = poly.Length - 1; i < poly.Length; j = i++)
+            if (poly[i].y > p.y != poly[j].y > p.y &&
+                p.x < (poly[j].x - poly[i].x) * (p.y - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x)
+                inside = !inside;
+        return inside;
+    }
+
+    // ---- polygon renderers ------------------------------------------------
+
+    MeshRenderer MakePoly(Transform parent, string name, int order)
+    {
+        var go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+        go.AddComponent<MeshFilter>();
+        var mr = go.AddComponent<MeshRenderer>();
+        mr.sharedMaterial = polyMaterial;
+        mr.sortingOrder = order;
+        mr.enabled = false;
+        return mr;
+    }
+
+    void SetPoly(MeshRenderer mr, Vector2[] poly)
+    {
+        var filter = mr.GetComponent<MeshFilter>();
+        var mesh = filter.sharedMesh;
+        if (mesh == null) { mesh = new Mesh { name = "Poly" }; filter.sharedMesh = mesh; }
+
+        // triangle fan from the centroid
+        Vector2 mid = Vector2.zero;
+        foreach (var v in poly) mid += v;
+        mid /= poly.Length;
+
+        var verts = new Vector3[poly.Length + 1];
+        verts[0] = mid;
+        for (int i = 0; i < poly.Length; i++) verts[i + 1] = poly[i];
+
+        var tris = new int[poly.Length * 3];
+        for (int i = 0; i < poly.Length; i++)
+        {
+            tris[i * 3] = 0;
+            tris[i * 3 + 1] = i + 1;
+            tris[i * 3 + 2] = (i + 1) % poly.Length + 1;
+        }
+
+        mesh.Clear();
+        mesh.vertices = verts;
+        mesh.triangles = tris;
+        mesh.RecalculateBounds();
+    }
+
+    void PolyColor(MeshRenderer mr, Color color)
+    {
+        if (polyBlock == null) polyBlock = new MaterialPropertyBlock();
+        mr.GetPropertyBlock(polyBlock);
+        polyBlock.SetColor("_Color", color);
+        mr.SetPropertyBlock(polyBlock);
+    }
+
     void BuildCellVisual(Cell cell)
     {
-        cell.root = new GameObject("Cell" + cell.col + "_" + cell.row).transform;
-        cell.root.SetParent(boardRoot, false);
-        cell.root.localPosition = CellLocalPos(cell.col, cell.row);
+        cell.floorMesh = MakePoly(cell.root, "Floor", Z_FLOOR);
+        SetPoly(cell.floorMesh, cell.inner);
+        PolyColor(cell.floorMesh, OPEN_TILE);
 
-        // the tile under everything: a cell that exists always shows floor, so the
-        // shape of the shaft reads even where the contents are still hidden
-        cell.floor = MakeSprite(cell.root, "Floor", tileSprite, Z_FLOOR);
-        FitSprite(cell.floor, tileSprite, BlockSize, BlockSize);
-        cell.floor.color = OPEN_TILE;
+        cell.outlineMesh = MakePoly(cell.root, "Outline", Z_OUTLINE);
+        SetPoly(cell.outlineMesh, Inset(cell.shape, Mathf.Max(0f, cellSize * (blockGap * 0.5f - outlineWidth * 0.5f))));
+        PolyColor(cell.outlineMesh, Color.white);
 
-        cell.outline = MakeSprite(cell.root, "Outline", outlineSprite, Z_OUTLINE);
-        cell.outline.color = Color.white;
-        cell.outline.enabled = false;
+        cell.bodyMesh = MakePoly(cell.root, "Body", Z_BODY);
+        SetPoly(cell.bodyMesh, cell.inner);
 
-        cell.body = MakeSprite(cell.root, "Body", null, Z_BODY);
-        cell.innerBody = MakeSprite(cell.root, "Inner", null, Z_INNER);
-        cell.innerBody2 = MakeSprite(cell.root, "Inner2", null, Z_INNER2);
+        // a buried layer is the same silhouette, pulled in — so a double reads as
+        // a stone inside a stone instead of looking like a plain one
+        cell.nestMesh = MakePoly(cell.root, "Nest", Z_INNER);
+        SetPoly(cell.nestMesh, Shrink(cell.inner, 0.62f));
+
+        cell.nestMesh2 = MakePoly(cell.root, "Nest2", Z_INNER2);
+        SetPoly(cell.nestMesh2, Shrink(cell.inner, 0.34f));
+
+        cell.iceMesh = MakePoly(cell.root, "Ice", Z_ICE);
+        SetPoly(cell.iceMesh, cell.inner);
+
         cell.icon = MakeSprite(cell.root, "Icon", null, Z_ICON);
-        cell.iceLayer = MakeSprite(cell.root, "Ice", iceSprite, Z_ICE);
-        cell.fog = MakeSprite(cell.root, "Fog", fogSprite, Z_FOG);
-        FitSprite(cell.fog, fogSprite, BlockSize, BlockSize);
     }
 
     void BuildDoor()
@@ -612,7 +893,7 @@ public class MarbleDown : MonoBehaviour
         root.localPosition = CellLocalPos((boardWidth - 1) * 0.5f, boardHeight);
 
         door = MakeSprite(root, "DoorBody", blankSprite, Z_BODY);
-        FitSprite(door, blankSprite, cellSize * (boardWidth * 0.6f), cellSize * 0.9f);
+        FitSprite(door, blankSprite, cellSize * (boardWidth * 0.6f), cellH * 0.9f);
         door.color = DOOR_LOCKED;
 
         doorText = MakeText(root, "DoorText", Vector3.zero, Z_CELL_TEXT, cellSize * 0.05f);
@@ -625,7 +906,7 @@ public class MarbleDown : MonoBehaviour
     Vector3 CellLocalPos(float col, float row)
     {
         float x = (col - (boardWidth - 1) * 0.5f) * cellSize;
-        float y = boardTopY - (row + 0.5f) * cellSize;
+        float y = boardTopY - (row + 0.5f) * cellH;
         return new Vector3(x, y, 0f);
     }
 
@@ -1064,16 +1345,37 @@ public class MarbleDown : MonoBehaviour
         Vector3 world = cam.ScreenToWorldPoint(screen);
         if (world.y > windowTop) return;                 // that's the HUD, not the board
 
-        float localY = world.y - scrollY;
-        int col = Mathf.RoundToInt(world.x / cellSize + (boardWidth - 1) * 0.5f);
-        int row = Mathf.FloorToInt((boardTopY - localY) / cellSize);
+        var local = new Vector2(world.x, world.y - scrollY);
+        if (local.y < boardTopY - boardHeight * cellH) { TryExit(); return; }
 
-        if (row == boardHeight) { TryExit(); return; }
-        if (col < 0 || col >= boardWidth || row < 0 || row >= boardHeight) return;
+        var hit = CellAt(local);
+        if (hit == null) return;
 
         // ignore anything still tucked under the HUD, including mid-scroll
-        if (boardTopY - row * cellSize + scrollY > windowTop + 0.001f) return;
-        TryBreak(board[col, row]);
+        if (hit.root.localPosition.y + scrollY > windowTop - cellH * 0.35f) return;
+        TryBreak(hit);
+    }
+
+    // Which polygon holds this point. Regions tile the board, so at most one does;
+    // the nearest centre is the fallback for a click that lands on a seam.
+    Cell CellAt(Vector2 local)
+    {
+        Cell nearest = null;
+        float best = cellSize * cellSize;
+
+        for (int r = 0; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+            {
+                var cell = board[c, r];
+                if (cell.shape == null) continue;
+
+                Vector2 site = cell.root.localPosition;
+                if (PointInPoly(local - site, cell.shape)) return cell;
+
+                float d = (local - site).sqrMagnitude;
+                if (d < best) { best = d; nearest = cell; }
+            }
+        return nearest;
     }
 
     void TryExit()
@@ -1102,11 +1404,14 @@ public class MarbleDown : MonoBehaviour
         return cell.twin != null && !cell.twin.broken && Touches(cell.twin);   // either half opens the pair
     }
 
+    // Anything sharing an edge counts, however short that edge is. Going by grid
+    // position instead refused to open stones the player was plainly touching.
     bool Touches(Cell cell)
     {
         if (cell.row == 0) return true;                  // the entrance is always open
-        return IsBroken(cell.col - 1, cell.row) || IsBroken(cell.col + 1, cell.row)
-            || IsBroken(cell.col, cell.row - 1) || IsBroken(cell.col, cell.row + 1);
+        foreach (var other in cell.neighbours)
+            if (other.broken) return true;
+        return false;
     }
 
     // Both bonus cells are gifts, so neither charges for the click.
@@ -1116,12 +1421,6 @@ public class MarbleDown : MonoBehaviour
     {
         if (!Reachable(cell)) return false;
         return !cell.ice || cell.freedNeighbours >= 2;
-    }
-
-    bool IsBroken(int c, int r)
-    {
-        if (c < 0 || c >= boardWidth || r < 0 || r >= boardHeight) return false;
-        return board[c, r].broken;
     }
 
     void TryBreak(Cell cell)
@@ -1183,19 +1482,14 @@ public class MarbleDown : MonoBehaviour
     void Opened(Cell cell)
     {
         deepestBroken = Mathf.Max(deepestBroken, cell.row);
-        Bump(cell.col - 1, cell.row);
-        Bump(cell.col + 1, cell.row);
-        Bump(cell.col, cell.row - 1);
-        Bump(cell.col, cell.row + 1);
+        foreach (var other in cell.neighbours) Bump(other);
     }
 
-    void Bump(int c, int r)
+    void Bump(Cell cell)
     {
-        if (c < 0 || c >= boardWidth || r < 0 || r >= boardHeight) return;
-        var n = board[c, r];
-        if (!n.ice || n.broken) return;
-        n.freedNeighbours++;
-        if (n.freedNeighbours >= 2) n.ice = false;
+        if (!cell.ice || cell.broken) return;
+        cell.freedNeighbours++;
+        if (cell.freedNeighbours >= 2) cell.ice = false;
     }
 
     // You are only dead when you cannot pay for a move AND no free energy cell is
@@ -1282,118 +1576,76 @@ public class MarbleDown : MonoBehaviour
 
     void RefreshCell(Cell cell, int distance)
     {
-        // a hole really is nothing: no floor either, the background is the abyss
-        cell.outline.enabled = false;
+        cell.outlineMesh.enabled = false;
+        cell.iceMesh.enabled = false;
+        cell.nestMesh.enabled = cell.nestMesh2.enabled = false;
 
+        // a hole really is nothing: no floor either, the background is the abyss
         if (cell.kind == Kind.Missing)
         {
-            cell.floor.enabled = false;
-            cell.body.enabled = cell.innerBody.enabled = cell.innerBody2.enabled = false;
-            cell.icon.enabled = cell.iceLayer.enabled = cell.fog.enabled = false;
+            cell.floorMesh.enabled = cell.bodyMesh.enabled = cell.icon.enabled = false;
             return;
         }
 
         // Every real cell keeps its tile whatever else is going on — dug out, still
-        // buried, or hidden behind a question mark. That is what makes the shaft
-        // read as a board instead of a few floating blocks.
-        cell.floor.enabled = true;
+        // buried, or hidden. That is what makes the shaft read as a board instead
+        // of a handful of floating stones.
+        cell.floorMesh.enabled = true;
 
         if (cell.broken)
         {
-            cell.body.enabled = cell.innerBody.enabled = cell.innerBody2.enabled = false;
-            cell.icon.enabled = cell.iceLayer.enabled = cell.fog.enabled = false;
+            cell.bodyMesh.enabled = cell.icon.enabled = false;
             return;
         }
 
         Color tint = Reachable(cell) ? Color.white : DIM;
+        cell.bodyMesh.enabled = true;
 
-        bool hidden = distance > revealRadius;
-        cell.fog.enabled = hidden;
-        cell.fog.color = tint;
-        if (hidden)
+        // Far from the dig the stone is drawn blank grey: you can see the shape of
+        // the shaft, not what it is cut from.
+        if (distance > revealRadius)
         {
-            cell.body.enabled = cell.innerBody.enabled = cell.innerBody2.enabled = false;
-            cell.icon.enabled = cell.iceLayer.enabled = false;
+            PolyColor(cell.bodyMesh, FOG_STONE * tint);
+            cell.icon.enabled = false;
             return;
         }
 
-        // a 2x1 is drawn once, by its head, stretched across both cells
         bool isBlock = cell.kind == Kind.Block;
-        bool tail = cell.twin != null && !cell.twinHead && !cell.twin.broken;
-        cell.body.enabled = isBlock && !tail;
-        if (cell.body.enabled)
-        {
-            // a stone shell reuses the grey square, with the real block showing
-            // through inside it — same read as a double, so it is obvious that it
-            // takes one click to crack and a second one to collect
-            bool rock = cell.color == STONE && cell.nest.Count == 0;
-            cell.body.sprite = cell.color != STONE ? blockSprites[cell.color]
-                             : rock ? tileSprite         // solid slab, nothing inside
-                                    : fogSprite;         // shell with a block under it
-            cell.body.color = rock ? SOLID_ROCK * tint : tint;
-            ShapeBody(cell);
+        Color fill = !isBlock ? OPEN_TILE
+                   : cell.color == STONE ? SOLID_ROCK
+                                         : BLOCK_COLORS[cell.color];
+        PolyColor(cell.bodyMesh, fill * tint);
 
-            if (Clickable(cell)) ShapeLike(cell.outline, cell, cellSize * outlineWidth);
-            cell.outline.enabled = Clickable(cell);
+        if (isBlock && cell.nest.Count > 0)
+        {
+            cell.nestMesh.enabled = true;
+            PolyColor(cell.nestMesh, BLOCK_COLORS[cell.nest[0]] * tint);
+        }
+        if (isBlock && cell.nest.Count > 1)
+        {
+            cell.nestMesh2.enabled = true;
+            PolyColor(cell.nestMesh2, BLOCK_COLORS[cell.nest[1]] * tint);
         }
 
-        DrawNested(cell.innerBody, cell, 0, cellSize * 0.62f, tint);
-        DrawNested(cell.innerBody2, cell, 1, cellSize * 0.34f, tint);
+        if (Clickable(cell))
+        {
+            cell.outlineMesh.enabled = true;
+            PolyColor(cell.outlineMesh, Color.white);
+        }
 
         cell.icon.enabled = !isBlock;
         if (cell.icon.enabled)
         {
             cell.icon.sprite = cell.kind == Kind.Energy ? energySprite : jarSprite;
             cell.icon.color = tint;
-            FitSprite(cell.icon, cell.icon.sprite, cellSize * 0.8f, cellSize * 0.8f);
+            FitSprite(cell.icon, cell.icon.sprite, cellSize * 0.55f, cellSize * 0.55f);
         }
 
-        cell.iceLayer.enabled = cell.ice;
+        // frozen: a translucent sheet over the stone, thinner once a neighbour has
+        // gone, which is the same "one move left" the cracked sprite used to say
+        cell.iceMesh.enabled = cell.ice;
         if (cell.ice)
-        {
-            // the cracked sprite says "one more neighbour" better than a digit did
-            var sprite = cell.freedNeighbours >= 1 && iceCrackedSprite != null ? iceCrackedSprite : iceSprite;
-            cell.iceLayer.sprite = sprite;
-            FitSprite(cell.iceLayer, sprite, BlockSize, BlockSize);
-            cell.iceLayer.color = tint;
-        }
-
-    }
-
-    // A pair's head stretches over both cells and shifts half a cell towards its
-    // partner, so the two read as one long block rather than two squares.
-    void ShapeBody(Cell cell) => ShapeLike(cell.body, cell, 0f);
-
-    // Lay a renderer over the cell — or over both cells of a 2x1 — grown by `pad`.
-    void ShapeLike(SpriteRenderer sr, Cell cell, float pad)
-    {
-        var twin = cell.twin;
-        if (twin == null || twin.broken || !cell.twinHead)
-        {
-            sr.transform.localPosition = Vector3.zero;
-            FitSprite(sr, sr.sprite, BlockSize + pad, BlockSize + pad);
-            return;
-        }
-
-        bool sideways = twin.row == cell.row;
-        sr.transform.localPosition = sideways
-            ? new Vector3(cellSize * 0.5f, 0f, 0f)
-            : new Vector3(0f, -cellSize * 0.5f, 0f);
-        FitSprite(sr, sr.sprite,
-            (sideways ? PairSize : BlockSize) + pad,
-            (sideways ? BlockSize : PairSize) + pad);
-    }
-
-    // One buried layer of a double / triple cell, drawn smaller inside the last one.
-    void DrawNested(SpriteRenderer sr, Cell cell, int index, float size, Color tint)
-    {
-        bool show = cell.kind == Kind.Block && cell.nest.Count > index;
-        sr.enabled = show;
-        if (!show) return;
-
-        sr.sprite = blockSprites[cell.nest[index]];
-        sr.color = tint;
-        FitSprite(sr, sr.sprite, size, size);
+            PolyColor(cell.iceMesh, (cell.freedNeighbours >= 1 ? ICE_CRACKED : ICE_FRESH) * tint);
     }
 
     // Chebyshev distance to the nearest broken cell, with the entrance row counted
@@ -1405,28 +1657,28 @@ public class MarbleDown : MonoBehaviour
             for (int c = 0; c < boardWidth; c++)
                 dist[c, r] = int.MaxValue;
 
-        var queue = new Queue<Vector2Int>();
+        var queue = new Queue<Cell>();
         for (int c = 0; c < boardWidth; c++)
         {
             dist[c, 0] = 1;
-            queue.Enqueue(new Vector2Int(c, 0));
+            queue.Enqueue(board[c, 0]);
         }
         for (int r = 0; r < boardHeight; r++)
             for (int c = 0; c < boardWidth; c++)
-                if (board[c, r].broken) { dist[c, r] = 0; queue.Enqueue(new Vector2Int(c, r)); }
+                if (board[c, r].broken) { dist[c, r] = 0; queue.Enqueue(board[c, r]); }
 
+        // spreads along the polygon graph, so what you can see follows what you
+        // could actually reach
         while (queue.Count > 0)
         {
-            var p = queue.Dequeue();
-            for (int dy = -1; dy <= 1; dy++)
-                for (int dx = -1; dx <= 1; dx++)
-                {
-                    int nc = p.x + dx, nr = p.y + dy;
-                    if (nc < 0 || nc >= boardWidth || nr < 0 || nr >= boardHeight) continue;
-                    if (dist[nc, nr] <= dist[p.x, p.y] + 1) continue;
-                    dist[nc, nr] = dist[p.x, p.y] + 1;
-                    queue.Enqueue(new Vector2Int(nc, nr));
-                }
+            var cell = queue.Dequeue();
+            int step = dist[cell.col, cell.row] + 1;
+            foreach (var other in cell.neighbours)
+            {
+                if (dist[other.col, other.row] <= step) continue;
+                dist[other.col, other.row] = step;
+                queue.Enqueue(other);
+            }
         }
         return dist;
     }
@@ -1459,15 +1711,15 @@ public class MarbleDown : MonoBehaviour
 
     float ScrollFor(int focusRow)
     {
-        float rowY = boardTopY - (focusRow + 0.5f) * cellSize;
+        float rowY = boardTopY - (focusRow + 0.5f) * cellH;
         float want = windowBottom + (boardTopY - windowBottom) * 0.5f;
         float offset = want - rowY;
 
         // Snap to whole cells. A free-floating offset left the top row sliced in
         // half under the HUD, and half a cell still invited a click.
-        float lowest = boardTopY - (boardHeight + 1.5f) * cellSize;
-        float maxOffset = Mathf.Ceil(Mathf.Max(0f, windowBottom - lowest) / cellSize) * cellSize;
-        return Mathf.Clamp(Mathf.Round(offset / cellSize) * cellSize, 0f, maxOffset);
+        float lowest = boardTopY - (boardHeight + 1.5f) * cellH;
+        float maxOffset = Mathf.Ceil(Mathf.Max(0f, windowBottom - lowest) / cellH) * cellH;
+        return Mathf.Clamp(Mathf.Round(offset / cellH) * cellH, 0f, maxOffset);
     }
 
     void ScrollBoard()

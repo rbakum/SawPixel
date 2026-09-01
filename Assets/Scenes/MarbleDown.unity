@@ -247,6 +247,10 @@ MonoBehaviour:
   boardWidth: 5
   boardHeight: 25
   visibleRows: 9
+  boardFill: 0.96
+  rowSquash: 0.78
+  polygonJitter: 0.4
+  sizeVariety: 0.3
   scrollLead: 1
   revealRadius: 6
   blockGap: 0.08
@@ -262,8 +266,8 @@ MonoBehaviour:
   tripleChance: 0.1
   crustChance: 0.08
   rockChance: 0.03
-  pairChance: 0.04
-  iceChance: 0.1
+  pairChance: 0
+  iceChance: 0
   energyChance: 0.035
   jarCellsPerLevel: 2
   plainTopRows: 2
