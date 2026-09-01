@@ -61,6 +61,7 @@ public class MarbleDown : MonoBehaviour
     [Range(0f, 0.5f)] public float doubleChance = 0.16f;
     [Range(0f, 0.3f)] public float tripleChance = 0.10f;   // chance a double goes one layer deeper
     [Range(0f, 0.5f)] public float crustChance = 0.08f;    // block sealed under a stone shell
+    [Range(0f, 0.3f)] public float rockChance = 0.03f;     // solid rock: one energy, nothing back
     [Range(0f, 0.3f)] public float pairChance = 0.04f;     // 2x1 block: one click clears both halves
     [Range(0f, 0.4f)] public float iceChance = 0.10f;
     [Range(0f, 0.2f)] public float energyChance = 0.035f;
@@ -101,6 +102,7 @@ public class MarbleDown : MonoBehaviour
     static readonly Color BONUS_JAR = new Color(1f, 0.84f, 0.25f);
     static readonly Color COST_TEXT = new Color(1f, 0.55f, 0.55f);
     static readonly Color GAIN_TEXT = new Color(0.65f, 1f, 0.45f);
+    static readonly Color SOLID_ROCK = new Color(0.55f, 0.54f, 0.58f);
     static readonly Color OPEN_TILE = new Color(0.52f, 0.09f, 0.27f);   // dug out, but still floor
     static readonly Color DOOR_LOCKED = new Color(0.35f, 0.10f, 0.22f);
     static readonly Color DOOR_OPEN = new Color(0.55f, 1f, 0.35f);
@@ -477,7 +479,11 @@ public class MarbleDown : MonoBehaviour
             cell.kind = Kind.Energy;
             return cell;
         }
-        if (Random.value < crustChance)
+        if (Random.value < rockChance)
+        {
+            cell.color = STONE;             // nothing underneath: pure dead weight
+        }
+        else if (Random.value < crustChance)
         {
             cell.nest.Add(cell.color);      // the real block hides under the shell
             cell.color = STONE;
@@ -1238,7 +1244,9 @@ public class MarbleDown : MonoBehaviour
         scrollTarget = ScrollFor(deepestBroken + scrollLead);
     }
 
-    static readonly Color DIM = new Color(0.42f, 0.36f, 0.44f, 1f);
+    // Neutral grey on purpose. The old tint had more blue than green in it, so it
+    // did not just darken — it dragged pink towards purple.
+    static readonly Color DIM = new Color(0.66f, 0.66f, 0.66f, 1f);
 
     void RefreshCell(Cell cell, int distance)
     {
@@ -1284,8 +1292,11 @@ public class MarbleDown : MonoBehaviour
             // a stone shell reuses the grey square, with the real block showing
             // through inside it — same read as a double, so it is obvious that it
             // takes one click to crack and a second one to collect
-            cell.body.sprite = cell.color == STONE ? fogSprite : blockSprites[cell.color];
-            cell.body.color = tint;
+            bool rock = cell.color == STONE && cell.nest.Count == 0;
+            cell.body.sprite = cell.color != STONE ? blockSprites[cell.color]
+                             : rock ? roundedSprite      // solid slab, nothing inside
+                                    : fogSprite;         // shell with a block under it
+            cell.body.color = rock ? SOLID_ROCK * tint : tint;
             ShapeBody(cell);
         }
 
