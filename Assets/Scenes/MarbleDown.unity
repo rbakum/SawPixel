@@ -249,6 +249,7 @@ MonoBehaviour:
   visibleRows: 9
   scrollLead: 1
   revealRadius: 6
+  blockGap: 0.08
   startEnergy: 8
   jarCapacityMin: 2
   jarCapacityMax: 3
@@ -259,6 +260,7 @@ MonoBehaviour:
   doubleChance: 0.16
   tripleChance: 0.1
   crustChance: 0.08
+  pairChance: 0.04
   iceChance: 0.1
   energyChance: 0.035
   jarCellsPerLevel: 2

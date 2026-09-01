@@ -40,6 +40,10 @@ public class MarbleDown : MonoBehaviour
     public int visibleRows = 9;
     public int scrollLead = 1;                 // rows kept below the dig before the board moves
     public int revealRadius = 6;
+    // How much a block shrinks inside its cell, so neighbours don't touch. This is
+    // an ABSOLUTE margin, not a scale: a 2x1 loses the same edge as a 1x1, or the
+    // gap around long blocks would come out twice as wide.
+    [Range(0f, 0.3f)] public float blockGap = 0.08f;
 
     [Header("Economy")]
     public int startEnergy = 8;
@@ -57,6 +61,7 @@ public class MarbleDown : MonoBehaviour
     [Range(0f, 0.5f)] public float doubleChance = 0.16f;
     [Range(0f, 0.3f)] public float tripleChance = 0.10f;   // chance a double goes one layer deeper
     [Range(0f, 0.5f)] public float crustChance = 0.08f;    // block sealed under a stone shell
+    [Range(0f, 0.3f)] public float pairChance = 0.04f;     // 2x1 block: one click clears both halves
     [Range(0f, 0.4f)] public float iceChance = 0.10f;
     [Range(0f, 0.2f)] public float energyChance = 0.035f;
     public int jarCellsPerLevel = 2;           // exactly this many, placed after the board is rolled
@@ -124,6 +129,8 @@ public class MarbleDown : MonoBehaviour
         // two = a rare triple. Each click peels exactly one layer.
         public readonly List<int> nest = new List<int>();
         public bool ice;
+        public Cell twin;                  // other half of a 2x1 block, null for a normal cell
+        public bool twinHead;              // the half that draws the stretched sprite
         public int freedNeighbours;        // broken neighbours so far; ice melts at 2
         public bool broken;
 
@@ -334,12 +341,46 @@ public class MarbleDown : MonoBehaviour
                 for (int c = 0; c < boardWidth; c++)
                     board[c, r] = MakeCell(c, r);
 
-            if (PathExists()) { PlaceJarCells(); PlaceIce(); return; }
+            if (PathExists()) { PlacePairs(); PlaceJarCells(); PlaceIce(); return; }
         }
         CarveEscape();                                   // pathological seed: cut one clean column
+        PlacePairs();
         PlaceJarCells();
         PlaceIce();
     }
+
+    // A 2x1 block spans two cells and falls to a single click, so it clears twice
+    // the ground for the same energy. Both halves still pay out their piece, which
+    // is what makes finding one worth a detour.
+    void PlacePairs()
+    {
+        for (int r = plainTopRows; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+            {
+                var head = board[c, r];
+                if (!PlainBlock(head) || Random.value >= pairChance) continue;
+
+                // prefer the rolled direction, fall back to the other one
+                bool sideways = Random.value < 0.5f;
+                Cell mate = sideways ? Sideways(c, r) : Downwards(c, r);
+                if (mate == null) mate = sideways ? Downwards(c, r) : Sideways(c, r);
+                if (mate == null) continue;
+
+                mate.color = head.color;
+                head.twin = mate;
+                mate.twin = head;
+                head.twinHead = true;
+            }
+    }
+
+    Cell Sideways(int c, int r) => c + 1 < boardWidth && PlainBlock(board[c + 1, r]) ? board[c + 1, r] : null;
+    Cell Downwards(int c, int r) => r + 1 < boardHeight && PlainBlock(board[c, r + 1]) ? board[c, r + 1] : null;
+
+    // Only a plain, unclaimed block may join a pair — no stone shell, no nesting,
+    // no ice, and nothing already paired.
+    bool PlainBlock(Cell cell)
+        => cell.kind == Kind.Block && cell.twin == null && !cell.ice
+        && cell.nest.Count == 0 && cell.color != STONE;
 
     // A fixed budget of jar cells per level rather than a per-cell chance, so the
     // fourth slot is a rare, findable thing instead of random weather.
@@ -348,7 +389,7 @@ public class MarbleDown : MonoBehaviour
         var spots = new List<Vector2Int>();
         for (int r = plainTopRows; r < boardHeight; r++)
             for (int c = 0; c < boardWidth; c++)
-                if (board[c, r].kind == Kind.Block) spots.Add(new Vector2Int(c, r));
+                if (board[c, r].kind == Kind.Block && board[c, r].twin == null) spots.Add(new Vector2Int(c, r));
 
         for (int i = spots.Count - 1; i > 0; i--)
         {
@@ -375,7 +416,7 @@ public class MarbleDown : MonoBehaviour
             for (int c = 0; c < boardWidth; c++)
             {
                 var cell = board[c, r];
-                if (cell.kind != Kind.Block || cell.ice || cell.color == STONE) continue;
+                if (cell.kind != Kind.Block || cell.ice || cell.color == STONE || cell.twin != null) continue;
                 if (Random.value >= iceChance) continue;
                 if (OpenableNeighbours(c, r) >= 2) cell.ice = true;
             }
@@ -515,7 +556,7 @@ public class MarbleDown : MonoBehaviour
         // the tile under everything: a cell that exists always shows floor, so the
         // shape of the shaft reads even where the contents are still hidden
         cell.floor = MakeSprite(cell.root, "Floor", roundedSprite, Z_FLOOR);
-        FitSprite(cell.floor, roundedSprite, cellSize * 0.94f, cellSize * 0.94f);
+        FitSprite(cell.floor, roundedSprite, BlockSize, BlockSize);
         cell.floor.color = OPEN_TILE;
 
         cell.body = MakeSprite(cell.root, "Body", null, Z_BODY);
@@ -524,6 +565,7 @@ public class MarbleDown : MonoBehaviour
         cell.icon = MakeSprite(cell.root, "Icon", null, Z_ICON);
         cell.iceLayer = MakeSprite(cell.root, "Ice", iceSprite, Z_ICE);
         cell.fog = MakeSprite(cell.root, "Fog", fogSprite, Z_FOG);
+        FitSprite(cell.fog, fogSprite, BlockSize, BlockSize);
     }
 
     void BuildDoor()
@@ -539,6 +581,9 @@ public class MarbleDown : MonoBehaviour
         doorText = MakeText(root, "DoorText", Vector3.zero, Z_CELL_TEXT, cellSize * 0.05f);
         doorText.text = "EXIT";
     }
+
+    float BlockSize => cellSize * (1f - blockGap);          // one cell, minus the gap
+    float PairSize => cellSize * (2f - blockGap);           // two cells, minus the SAME gap
 
     Vector3 CellLocalPos(float col, float row)
     {
@@ -1016,6 +1061,12 @@ public class MarbleDown : MonoBehaviour
     bool Reachable(Cell cell)
     {
         if (cell.broken || cell.kind == Kind.Missing) return false;
+        if (Touches(cell)) return true;
+        return cell.twin != null && !cell.twin.broken && Touches(cell.twin);   // either half opens the pair
+    }
+
+    bool Touches(Cell cell)
+    {
         if (cell.row == 0) return true;                  // the entrance is always open
         return IsBroken(cell.col - 1, cell.row) || IsBroken(cell.col + 1, cell.row)
             || IsBroken(cell.col, cell.row - 1) || IsBroken(cell.col, cell.row + 1);
@@ -1070,22 +1121,34 @@ public class MarbleDown : MonoBehaviour
                     cell.color = cell.nest[0];
                     cell.nest.RemoveAt(0);
                 }
-                else cell.broken = true;
+                else
+                {
+                    cell.broken = true;
+                    var twin = cell.twin;
+                    if (twin != null && !twin.broken)
+                    {
+                        SpawnPieces(twin, twin.color, piecesPerBlock);   // the far half pays too
+                        twin.broken = true;
+                        Opened(twin);
+                    }
+                }
                 break;
         }
 
-        if (cell.broken)
-        {
-            deepestBroken = Mathf.Max(deepestBroken, cell.row);
-            Bump(cell.col - 1, cell.row);
-            Bump(cell.col + 1, cell.row);
-            Bump(cell.col, cell.row - 1);
-            Bump(cell.col, cell.row + 1);
-        }
+        if (cell.broken) Opened(cell);
 
         RefreshBoard();
         RefreshHud();
         CheckLoss();
+    }
+
+    void Opened(Cell cell)
+    {
+        deepestBroken = Mathf.Max(deepestBroken, cell.row);
+        Bump(cell.col - 1, cell.row);
+        Bump(cell.col + 1, cell.row);
+        Bump(cell.col, cell.row - 1);
+        Bump(cell.col, cell.row + 1);
     }
 
     void Bump(int c, int r)
@@ -1159,7 +1222,13 @@ public class MarbleDown : MonoBehaviour
 
         for (int r = 0; r < boardHeight; r++)
             for (int c = 0; c < boardWidth; c++)
-                RefreshCell(board[c, r], dist[c, r]);
+            {
+                var cell = board[c, r];
+                int d = dist[c, r];
+                if (cell.twin != null && !cell.twin.broken)
+                    d = Mathf.Min(d, dist[cell.twin.col, cell.twin.row]);
+                RefreshCell(cell, d);
+            }
 
         bool open = DoorOpen();
         door.color = open ? DOOR_OPEN : DOOR_LOCKED;
@@ -1206,16 +1275,18 @@ public class MarbleDown : MonoBehaviour
             return;
         }
 
+        // a 2x1 is drawn once, by its head, stretched across both cells
         bool isBlock = cell.kind == Kind.Block;
-        cell.body.enabled = isBlock;
-        if (isBlock)
+        bool tail = cell.twin != null && !cell.twinHead && !cell.twin.broken;
+        cell.body.enabled = isBlock && !tail;
+        if (cell.body.enabled)
         {
             // a stone shell reuses the grey square, with the real block showing
             // through inside it — same read as a double, so it is obvious that it
             // takes one click to crack and a second one to collect
             cell.body.sprite = cell.color == STONE ? fogSprite : blockSprites[cell.color];
             cell.body.color = tint;
-            FitSprite(cell.body, cell.body.sprite, cellSize, cellSize);
+            ShapeBody(cell);
         }
 
         DrawNested(cell.innerBody, cell, 0, cellSize * 0.62f, tint);
@@ -1235,10 +1306,31 @@ public class MarbleDown : MonoBehaviour
             // the cracked sprite says "one more neighbour" better than a digit did
             var sprite = cell.freedNeighbours >= 1 && iceCrackedSprite != null ? iceCrackedSprite : iceSprite;
             cell.iceLayer.sprite = sprite;
-            FitSprite(cell.iceLayer, sprite, cellSize, cellSize);
+            FitSprite(cell.iceLayer, sprite, BlockSize, BlockSize);
             cell.iceLayer.color = tint;
         }
 
+    }
+
+    // A pair's head stretches over both cells and shifts half a cell towards its
+    // partner, so the two read as one long block rather than two squares.
+    void ShapeBody(Cell cell)
+    {
+        var twin = cell.twin;
+        if (twin == null || twin.broken || !cell.twinHead)
+        {
+            cell.body.transform.localPosition = Vector3.zero;
+            FitSprite(cell.body, cell.body.sprite, BlockSize, BlockSize);
+            return;
+        }
+
+        bool sideways = twin.row == cell.row;
+        cell.body.transform.localPosition = sideways
+            ? new Vector3(cellSize * 0.5f, 0f, 0f)
+            : new Vector3(0f, -cellSize * 0.5f, 0f);
+        FitSprite(cell.body, cell.body.sprite,
+            sideways ? PairSize : BlockSize,
+            sideways ? BlockSize : PairSize);
     }
 
     // One buried layer of a double / triple cell, drawn smaller inside the last one.
