@@ -27,7 +27,7 @@ using UnityEngine;
 public class MarbleDown : MonoBehaviour
 {
     [Header("Sprites")]
-    public Sprite[] blockSprites;              // one per color, index == color id
+    public Sprite[] blockSprites;              // unused while the board is flat-coloured
     public Sprite iceSprite;
     public Sprite iceCrackedSprite;            // one neighbour left to go
     public Sprite fogSprite;
@@ -141,6 +141,7 @@ public class MarbleDown : MonoBehaviour
         new Color(1f, 0.216f, 0.851f),    // pink
         new Color(0.718f, 0.098f, 1f),    // purple
         new Color(1f, 0.780f, 0.102f),    // yellow
+        new Color(0.15f, 0.55f, 1f),      // blue
     };
 
     enum Kind { Block, Energy, JarCell, Missing }
@@ -267,13 +268,6 @@ public class MarbleDown : MonoBehaviour
 
     void Build()
     {
-        if (blockSprites == null || blockSprites.Length == 0)
-        {
-            Debug.LogError("[MarbleDown] assign Block Sprites (one per color) on the component", this);
-            enabled = false;
-            return;
-        }
-
         SetupCamera();
         MakeBlank();
         LoadFont();
@@ -592,7 +586,7 @@ public class MarbleDown : MonoBehaviour
                 board[col, r] = new Cell { col = col, row = r, kind = Kind.Block, color = RandomColor() };
     }
 
-    int RandomColor() => Random.Range(0, Mathf.Min(BLOCK_COLORS.Length, blockSprites.Length));
+    int RandomColor() => Random.Range(0, BLOCK_COLORS.Length);
 
     // ---- board visuals ----------------------------------------------------
 
@@ -1061,7 +1055,7 @@ public class MarbleDown : MonoBehaviour
     // and what was still buried, which quietly refunded every wrong dig — pieces
     // nobody wanted always got a matching jar eventually. Straight random means a
     // wrong colour is a real loss.
-    int PickJarColor() => Random.Range(0, Mathf.Min(BLOCK_COLORS.Length, blockSprites.Length));
+    int PickJarColor() => Random.Range(0, BLOCK_COLORS.Length);
 
     void RefreshJars()
     {
@@ -1192,7 +1186,10 @@ public class MarbleDown : MonoBehaviour
             var go = new GameObject("Piece");
             go.transform.SetParent(pieceRoot, false);
             var sr = go.AddComponent<SpriteRenderer>();
-            sr.sprite = blockSprites[color];
+            // flat tint rather than the wood squares: the board itself is flat now,
+            // and the palette is no longer limited to how many sprites exist
+            sr.sprite = tileSprite;
+            sr.color = BLOCK_COLORS[color];
             sr.sortingOrder = Z_PIECE;
             FitSprite(sr, sr.sprite, pieceSize, pieceSize);
 
