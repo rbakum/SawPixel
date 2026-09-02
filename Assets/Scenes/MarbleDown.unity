@@ -249,15 +249,17 @@ MonoBehaviour:
   visibleRows: 9
   boardFill: 0.96
   rowSquash: 0.78
-  polygonJitter: 0.4
-  sizeVariety: 0.3
   scrollLead: 1
   revealRadius: 6
   blockGap: 0.08
   outlineWidth: 0.05
+  polygonJitter: 0.4
+  sizeVariety: 0.3
   startEnergy: 8
   jarCapacityMin: 2
   jarCapacityMax: 3
+  jarPayoutBase: 2
+  jarPayoutStep: 1
   piecesPerBlock: 1
   jarSlots: 3
   missingChance: 0.09
@@ -265,12 +267,12 @@ MonoBehaviour:
   doubleChance: 0.16
   tripleChance: 0.1
   crustChance: 0.08
-  rockChance: 0.03
+  rockChance: 0.5
   pairChance: 0
   iceChance: 0
-  energyChance: 0.035
+  energyCellsPerLevel: 12
   jarCellsPerLevel: 2
-  plainTopRows: 2
+  plainTopRows: 0
   beltSpeed: 0.07
   flightTime: 0.45
   beltDwell: 0.5

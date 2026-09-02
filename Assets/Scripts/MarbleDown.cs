@@ -71,6 +71,12 @@ public class MarbleDown : MonoBehaviour
     // everything you waste on a color nobody wants is a real loss.
     public int jarCapacityMin = 2;
     public int jarCapacityMax = 3;
+    // What a filled jar pays. Not a multiplier any more: the small jar should only
+    // return what it cost, while the big one is the one worth chasing.
+    //   smallest jar -> jarPayoutBase        (2 costs 2 clicks, pays 2: break even)
+    //   each size up -> + jarPayoutStep      (3 costs 3 clicks, pays 4: worth it)
+    public int jarPayoutBase = 2;
+    public int jarPayoutStep = 1;
     public int piecesPerBlock = 1;
     public int jarSlots = 3;
 
@@ -80,12 +86,14 @@ public class MarbleDown : MonoBehaviour
     [Range(0f, 0.5f)] public float doubleChance = 0.16f;
     [Range(0f, 0.3f)] public float tripleChance = 0.10f;   // chance a double goes one layer deeper
     [Range(0f, 0.5f)] public float crustChance = 0.08f;    // block sealed under a stone shell
-    [Range(0f, 0.3f)] public float rockChance = 0.03f;     // solid rock: one energy, nothing back
+    // Half the shaft is dead rock: a click that buys ground and nothing else, so
+    // coloured crystals become the scarce thing worth routing towards.
+    [Range(0f, 0.8f)] public float rockChance = 0.5f;      // solid rock: one energy, nothing back
     [Range(0f, 0.3f)] public float pairChance = 0.0f;      // parked: a 2x1 needs two polygons merged
     [Range(0f, 0.4f)] public float iceChance = 0.0f;      // parked
-    [Range(0f, 0.2f)] public float energyChance = 0.035f;
+    public int energyCellsPerLevel = 12;        // a fixed scatter, not a per-cell roll
     public int jarCellsPerLevel = 2;           // exactly this many, placed after the board is rolled
-    public int plainTopRows = 2;               // no specials this close to the entrance
+    public int plainTopRows = 0;               // 0 = the shaft is random right from the top
 
     [Header("Conveyor")]
     public float beltSpeed = 0.07f;            // loops per second
@@ -128,7 +136,7 @@ public class MarbleDown : MonoBehaviour
     static readonly Color COST_TEXT = new Color(1f, 0.55f, 0.55f);
     static readonly Color GAIN_TEXT = new Color(0.65f, 1f, 0.45f);
     static readonly Color SOLID_ROCK = new Color(0.55f, 0.54f, 0.58f);
-    static readonly Color FOG_STONE = new Color(0.44f, 0.42f, 0.47f);
+    static readonly Color FOG_STONE = new Color(0.30f, 0.17f, 0.24f);   // unexplored: dark, not stone
     static readonly Color ICE_FRESH = new Color(0.55f, 0.85f, 1f, 0.85f);
     static readonly Color ICE_CRACKED = new Color(0.72f, 0.93f, 1f, 0.55f);
     static readonly Color OPEN_TILE = new Color(0.52f, 0.09f, 0.27f);   // dug out, but still floor
@@ -392,11 +400,12 @@ public class MarbleDown : MonoBehaviour
                 for (int c = 0; c < boardWidth; c++)
                     board[c, r] = MakeCell(c, r);
 
-            if (PathExists()) { PlacePairs(); PlaceJarCells(); PlaceIce(); return; }
+            if (PathExists()) { PlacePairs(); PlaceJarCells(); PlaceEnergyCells(); PlaceIce(); return; }
         }
         CarveEscape();                                   // pathological seed: cut one clean column
         PlacePairs();
         PlaceJarCells();
+        PlaceEnergyCells();
         PlaceIce();
     }
 
@@ -433,9 +442,16 @@ public class MarbleDown : MonoBehaviour
         => cell.kind == Kind.Block && cell.twin == null && !cell.ice
         && cell.nest.Count == 0 && cell.color != STONE;
 
+    // Energy pickups are a fixed scatter too, so "two more" means exactly two more
+    // rather than a shift in the odds.
+    void PlaceEnergyCells() => Scatter(energyCellsPerLevel, Kind.Energy);
+
     // A fixed budget of jar cells per level rather than a per-cell chance, so the
     // fourth slot is a rare, findable thing instead of random weather.
-    void PlaceJarCells()
+    void PlaceJarCells() => Scatter(jarCellsPerLevel, Kind.JarCell);
+
+    // Drop `count` cells of `kind` onto random plain blocks.
+    void Scatter(int count, Kind kind)
     {
         var spots = new List<Vector2Int>();
         for (int r = plainTopRows; r < boardHeight; r++)
@@ -448,11 +464,11 @@ public class MarbleDown : MonoBehaviour
             (spots[i], spots[j]) = (spots[j], spots[i]);
         }
 
-        int placed = Mathf.Min(jarCellsPerLevel, spots.Count);
+        int placed = Mathf.Min(count, spots.Count);
         for (int i = 0; i < placed; i++)
         {
             var cell = board[spots[i].x, spots[i].y];
-            cell.kind = Kind.JarCell;
+            cell.kind = kind;
             cell.nest.Clear();
             cell.color = RandomColor();
         }
@@ -522,12 +538,6 @@ public class MarbleDown : MonoBehaviour
             return cell;
         }
 
-        float roll = Random.value;
-        if (roll < energyChance)
-        {
-            cell.kind = Kind.Energy;
-            return cell;
-        }
         if (Random.value < rockChance)
         {
             cell.color = STONE;             // nothing underneath: pure dead weight
@@ -1077,7 +1087,7 @@ public class MarbleDown : MonoBehaviour
     {
         bool wasBonus = jar.bonus;
         jars.Remove(jar);
-        SpawnMotes(jar.root.position, jar.capacity);
+        SpawnMotes(jar.root.position, JarPayout(jar.capacity));
         fadingJars.Add(new Fading { root = jar.root, t = 0f });
 
         if (!wasBonus) AddJar(false);      // permanent slots refill; the bonus one is spent
@@ -1096,6 +1106,9 @@ public class MarbleDown : MonoBehaviour
         tm.color = color;
         floaters.Add(new Floater { tm = tm, from = worldPos, t = 0f });
     }
+
+    int JarPayout(int capacity)
+        => Mathf.Max(0, jarPayoutBase + (capacity - Mathf.Min(jarCapacityMin, jarCapacityMax)) * jarPayoutStep);
 
     void SpawnMotes(Vector3 from, int count)
     {
