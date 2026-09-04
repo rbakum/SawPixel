@@ -539,8 +539,11 @@ public class MarbleDown : MonoBehaviour
         }
         else if (Random.value < doubleChance)
         {
-            cell.nest.Add(RandomColor());
-            if (Random.value < tripleChance) cell.nest.Add(RandomColor());
+            // each layer must differ from the one directly around it, or the ring
+            // between them is invisible and the stone reads as a plain single.
+            // A triple's outer and innermost MAY match — there is a layer between.
+            cell.nest.Add(RandomColorExcept(cell.color));
+            if (Random.value < tripleChance) cell.nest.Add(RandomColorExcept(cell.nest[0]));
         }
         return cell;
     }
@@ -587,6 +590,17 @@ public class MarbleDown : MonoBehaviour
     }
 
     int RandomColor() => Random.Range(0, BLOCK_COLORS.Length);
+
+    // Same roll, minus one colour: shifting anything at or above the excluded
+    // index keeps every remaining colour equally likely.
+    int RandomColorExcept(int avoid)
+    {
+        int n = BLOCK_COLORS.Length;
+        if (avoid < 0 || avoid >= n || n < 2) return RandomColor();
+
+        int pick = Random.Range(0, n - 1);
+        return pick >= avoid ? pick + 1 : pick;
+    }
 
     // ---- board visuals ----------------------------------------------------
 
