@@ -43,7 +43,7 @@ public class MarbleDown : MonoBehaviour
     // 5.7 rows on screen; squashing them a little buys the rows back and, on
     // polygons, is invisible.
     [Range(0.6f, 1f)] public float rowSquash = 0.78f;
-    public int scrollLead = 0;                 // rows kept below the dig before the board moves
+    public int scrollLead = 1;                 // rows kept below the dig before the board moves
     public int revealRadius = 6;
     // How much a block shrinks inside its cell, so neighbours don't touch. This is
     // an ABSOLUTE margin, not a scale: a 2x1 loses the same edge as a 1x1, or the
@@ -155,6 +155,15 @@ public class MarbleDown : MonoBehaviour
     // it costs a click to chip off and pays nothing back. Two clicks, one piece,
     // so every petrified stone is one energy gone for good.
     const int STONE = -1;
+
+    // How much heavier a phantom top-row site is than a real one. Above 1 its
+    // bisector sits below the halfway point, so row 0 keeps a natural, fully
+    // visible top edge instead of being cut by the board rectangle.
+    const float TOP_GHOST_BIAS = 2.6f;
+
+    // Smallest gap, in cells, between the top row and the HUD line. Has to clear
+    // the seam and the outline ring or the edge stops reading as an edge.
+    const float TOP_CLEARANCE = 0.09f;
 
     class Cell
     {
@@ -644,13 +653,37 @@ public class MarbleDown : MonoBehaviour
                 Vector3 home = CellLocalPos(c, r);
                 Vector2 offset = Random.insideUnitCircle * (Mathf.Min(cellSize, cellH) * polygonJitter);
                 sites[c, r] = new Vector2(home.x + offset.x, home.y + offset.y);
+                // row 0 may drift down but never up: a site nudged towards the HUD
+                // drags its bisector with the phantom row over the line with it
+                if (r == 0) sites[c, r].y = Mathf.Min(sites[c, r].y, home.y);
 
                 float grow = Random.Range(1f - sizeVariety, 1f + sizeVariety) * Mathf.Min(cellSize, cellH) * 0.5f;
                 weights[c, r] = grow * grow;
             }
 
+        // A rectangle chopped the top row flat: a straight cut with no outline on
+        // it, which read as a rendering bug rather than a shape. Row 0 is clipped
+        // against a phantom row sitting above the board instead, so the top edge
+        // comes out of the same diagram as every other edge. The phantoms are
+        // heavier than a real cell, which pushes their bisectors down and keeps the
+        // whole top row below the HUD line without amputating it.
+        var ghost = new Vector2[boardWidth];
+        float ghostWeight;
+        {
+            float grow = Mathf.Min(cellSize, cellH) * 0.5f;
+            ghostWeight = grow * grow * TOP_GHOST_BIAS;
+            for (int c = 0; c < boardWidth; c++)
+            {
+                Vector3 home = CellLocalPos(c, -1);
+                Vector2 off = Random.insideUnitCircle * (Mathf.Min(cellSize, cellH) * polygonJitter);
+                ghost[c] = new Vector2(home.x + off.x, home.y + off.y * 0.35f);
+            }
+        }
+
         float half = boardWidth * cellSize * 0.5f;
-        float top = boardTopY, bottom = boardTopY - boardHeight * cellH;
+        // room above the line for the phantoms to carve into; the safety clip below
+        // puts the ceiling back at boardTopY
+        float top = boardTopY + cellH, bottom = boardTopY - boardHeight * cellH;
 
         for (int r = 0; r < boardHeight; r++)
             for (int c = 0; c < boardWidth; c++)
@@ -672,6 +705,25 @@ public class MarbleDown : MonoBehaviour
                         poly = ClipToNearer(poly, site, sites[nc, nr], weights[c, r], weights[nc, nr]);
                         if (poly.Count < 3) break;
                     }
+                if (r <= 1)
+                    for (int i = 0; i < boardWidth && poly.Count >= 3; i++)
+                        poly = ClipToNearer(poly, site, ghost[i], weights[c, r], ghostWeight);
+
+                // Guaranteed clearance under the HUD. A polygon flush with the line
+                // has no room left for its seam and its outline, so it reads as a
+                // cut instead of a shape. The cut is tilted per cell, which lets it
+                // pass for one more Voronoi edge instead of lining every cell up
+                // along one long horizontal scar.
+                var lean = new Vector2(Random.Range(-0.16f, 0.16f), 1f).normalized;
+                float slope = lean.x / lean.y;
+                float reach = 0f;
+                foreach (var v in poly) reach = Mathf.Max(reach, Mathf.Abs(v.x - site.x));
+                // drop the pivot by however far the tilt climbs over this polygon, so
+                // the highest corner still clears; the clearance itself varies per cell
+                // so the cuts never line up into one straight edge across the board
+                float ceilY = boardTopY - cellH * Random.Range(TOP_CLEARANCE, TOP_CLEARANCE * 2.2f)
+                                        - Mathf.Abs(slope) * reach;
+                poly = ClipUnder(poly, lean, new Vector2(site.x, ceilY));
                 if (poly.Count < 3) poly = SquareAround(site);
 
                 var cell = board[c, r];
@@ -741,6 +793,22 @@ public class MarbleDown : MonoBehaviour
             new Vector2(site.x - h, site.y - h), new Vector2(site.x + h, site.y - h),
             new Vector2(site.x + h, site.y + h), new Vector2(site.x - h, site.y + h),
         };
+    }
+
+    // Sutherland-Hodgman against the line through `at` with normal `n`, keeping the side `n` points away from.
+    List<Vector2> ClipUnder(List<Vector2> poly, Vector2 n, Vector2 at)
+    {
+        float limit = Vector2.Dot(n, at);
+        var result = new List<Vector2>(poly.Count + 2);
+        for (int i = 0; i < poly.Count; i++)
+        {
+            Vector2 a = poly[i], b = poly[(i + 1) % poly.Count];
+            float da = Vector2.Dot(n, a) - limit, db = Vector2.Dot(n, b) - limit;
+            if (da <= 0f) result.Add(a);
+            if ((da < 0f && db > 0f) || (da > 0f && db < 0f))
+                result.Add(Vector2.Lerp(a, b, da / (da - db)));
+        }
+        return result;
     }
 
     // Sutherland-Hodgman against the border between the two sites. With equal
