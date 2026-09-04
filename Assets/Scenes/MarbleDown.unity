@@ -260,6 +260,8 @@ MonoBehaviour:
   jarCapacityMax: 4
   piecesPerBlock: 1
   jarSlots: 3
+  previewJars: 1
+  previewScale: 0.6
   missingChance: 0.09
   missingEdgeBias: 2.2
   doubleChance: 0.16

@@ -75,7 +75,7 @@ public class MarbleDown : MonoBehaviour
     public int jarSlots = 3;
     // Small jars parked on the right showing which colours come next. They do not
     // catch anything — they only let the player plan.
-    public int previewJars = 2;
+    public int previewJars = 1;
     [Range(0.3f, 0.9f)] public float previewScale = 0.6f;
 
     [Header("Board mix")]
@@ -129,6 +129,7 @@ public class MarbleDown : MonoBehaviour
     static readonly Color ENERGY_LOW_FLASH = new Color(1f, 0.70f, 0.70f);
     static readonly Color ENERGY_DIGITS = new Color(0.16f, 0.13f, 0.10f);     // readable on all three
     static readonly Color BONUS_JAR = new Color(1f, 0.84f, 0.25f);
+    static readonly Color JAR_SOCKET = new Color(0.30f, 0.03f, 0.15f);
     static readonly Color COST_TEXT = new Color(1f, 0.55f, 0.55f);
     static readonly Color GAIN_TEXT = new Color(0.65f, 1f, 0.45f);
     static readonly Color SOLID_ROCK = new Color(0.55f, 0.54f, 0.58f);
@@ -185,7 +186,7 @@ public class MarbleDown : MonoBehaviour
         public int incoming;               // pieces already flying to this jar
         public bool bonus;
         public bool preview;                   // waiting on the right, not catching anything yet
-        public float appear;                   // 0..1 pop-in, so jars never swap in one frame
+        public float targetScale = 1f;         // 1 on the shelf, smaller while waiting
         public Vector3 targetPos;              // slid towards, so the queue shuffles instead of snapping
         public Transform root;
         public SpriteRenderer glass, lid, frame, payIcon;
@@ -212,6 +213,7 @@ public class MarbleDown : MonoBehaviour
     Sprite roundedSprite;      // soft rounding, for HUD decoration
     Sprite tileSprite;         // matches the block art's own corners
     Sprite outlineSprite;      // those corners pushed outwards by the ring width
+    Sprite circleSprite;       // the socket the next jar waits in
 
     Cell[,] board;
     readonly List<Jar> jars = new List<Jar>();
@@ -230,6 +232,7 @@ public class MarbleDown : MonoBehaviour
     SpriteRenderer door;
     TextMesh doorText, energyText, statusText;
     SpriteRenderer energyPanel;
+    SpriteRenderer jarSocket;
 
     float halfW, halfH, cellSize, cellH;
     float windowTop, windowBottom, boardTopY;
@@ -263,6 +266,7 @@ public class MarbleDown : MonoBehaviour
         fadingJars.Clear(); motes.Clear(); floaters.Clear();
         boardRoot = hudRoot = pieceRoot = null;
         energyPanel = null;
+        jarSocket = null;
         finished = false;
         deepestBroken = -1;
         scrollY = scrollTarget = 0f;
@@ -335,6 +339,7 @@ public class MarbleDown : MonoBehaviour
         float ring = (BLOCK_CORNER * block + pad * 0.5f) / (block + pad);
 
         tileSprite = MakeRoundedSprite(128, BLOCK_CORNER);
+        circleSprite = MakeRoundedSprite(128, 0.5f);      // corner radius = half a side, so: a circle
         outlineSprite = MakeRoundedSprite(128, ring);
     }
 
@@ -985,6 +990,11 @@ public class MarbleDown : MonoBehaviour
         FitSprite(shelf, blankSprite, halfW * 1.45f, 0.07f * halfH);
         shelf.color = HUD_SHELF;
 
+        // the dim well the next jar sits in until its turn comes
+        jarSocket = MakeSprite(hudRoot, "JarSocket", circleSprite, Z_HUD_BG + 2);
+        jarSocket.color = JAR_SOCKET;
+        jarSocket.enabled = false;
+
         BuildBeltVisual();
         BuildEnergyVisual();
 
@@ -1050,12 +1060,11 @@ public class MarbleDown : MonoBehaviour
         jar.payIcon = MakeSprite(jar.root, "PayIcon", energySprite, Z_HUD_TOP);
         jar.payText = MakeText(jar.root, "Pay", Vector3.zero, Z_HUD_TEXT, halfH * 0.016f);
 
-        jar.root.localScale = Vector3.one * 0.2f;      // grows in via UpdateFeel
-
         // actives first, previews after — the order is what the layout walks
         jars.Insert(preview ? jars.Count : FirstPreviewIndex(), jar);
         LayoutJars();
         jar.root.localPosition = jar.targetPos;        // a new jar appears in place; the rest slide
+        jar.root.localScale = Vector3.one * jar.targetScale * 0.2f;   // and pops open
     }
 
     int FirstPreviewIndex()
@@ -1072,20 +1081,35 @@ public class MarbleDown : MonoBehaviour
     {
         float y = 0.82f * halfH;
 
-        float units = 0f;
-        foreach (var jar in jars) units += jar.preview ? previewScale : 1f;
-        float w = Mathf.Min(0.20f * halfH, 1.55f * halfW / Mathf.Max(0.01f, units + 0.25f * (jars.Count - 1)));
-        float spacing = w * 0.25f;
+        int actives = 0;
+        foreach (var jar in jars) if (!jar.preview) actives++;
 
-        float total = spacing * (jars.Count - 1);
-        foreach (var jar in jars) total += w * (jar.preview ? previewScale : 1f);
+        // the shelf is sized for the working jars alone — the waiting one lives
+        // off to the side and must not squeeze them
+        float w = Mathf.Min(0.20f * halfH, 1.5f * halfW / Mathf.Max(1, actives));
+        float step = w * 1.25f;
+        float x0 = -step * (actives - 1) * 0.5f;
 
-        float x = -total * 0.5f;
+        float socketR = w * previewScale * 0.62f;
+        float socketX = 0.96f * halfW - socketR;
+        jarSocket.enabled = false;
+
+        int slot = 0;
         foreach (var jar in jars)
         {
-            float jw = w * (jar.preview ? previewScale : 1f);
-            jar.targetPos = new Vector3(x + jw * 0.5f, y, 0f);
-            x += jw + spacing;
+            if (jar.preview)
+            {
+                jar.targetPos = new Vector3(socketX, y, 0f);
+                jarSocket.enabled = true;
+                jarSocket.transform.localPosition = jar.targetPos;
+                FitSprite(jarSocket, circleSprite, socketR * 2f, socketR * 2f);
+            }
+            else jar.targetPos = new Vector3(x0 + step * slot++, y, 0f);
+
+            // every jar is built at full size; the root scale is what makes the
+            // waiting one small, so promoting it just grows the scale back to 1
+            jar.targetScale = jar.preview ? previewScale : 1f;
+            float jw = w;
 
             FitSprite(jar.glass, jarSprite, jw * 0.82f, jw * 0.90f);
             FitSprite(jar.frame, roundedSprite, jw * 1.10f, jw * 1.20f);
@@ -1096,10 +1120,10 @@ public class MarbleDown : MonoBehaviour
 
             // reward sits under the jar, next to a lightning bolt so it never
             // reads as "pieces still needed"
-            FitSprite(jar.payIcon, energySprite, jw * 0.30f, jw * 0.30f);
-            jar.payIcon.transform.localPosition = new Vector3(-jw * 0.20f, -jw * 0.58f, 0f);
-            jar.payText.transform.localPosition = new Vector3(jw * 0.16f, -jw * 0.58f, 0f);
-            jar.payText.characterSize = jw * 0.042f;
+            FitSprite(jar.payIcon, energySprite, jw * 0.195f, jw * 0.195f);
+            jar.payIcon.transform.localPosition = new Vector3(-jw * 0.13f, -jw * 0.58f, 0f);
+            jar.payText.transform.localPosition = new Vector3(jw * 0.104f, -jw * 0.58f, 0f);
+            jar.payText.characterSize = jw * 0.0273f;
         }
         RefreshJars();
     }
@@ -1123,7 +1147,7 @@ public class MarbleDown : MonoBehaviour
             // a preview only says which colour is coming, nothing else
             jar.text.text = jar.preview ? "" : (jar.capacity - jar.filled).ToString();
             jar.text.color = new Color(0.15f, 0.05f, 0.10f);
-            jar.payText.text = jar.preview ? "" : jar.capacity.ToString();
+            jar.payText.text = jar.preview ? "" : "+" + jar.capacity;
             jar.payText.color = new Color(1f, 0.86f, 0.45f);
             jar.payIcon.enabled = !jar.preview;
         }
@@ -1188,16 +1212,13 @@ public class MarbleDown : MonoBehaviour
 
     void UpdateFeel(float dt)
     {
-        for (int i = 0; i < jars.Count; i++)
+        // One lerp covers everything: popping open, sliding along the shelf, and
+        // flying out of the socket at full size when a jar's turn comes.
+        float k = 1f - Mathf.Exp(-12f * dt);
+        foreach (var jar in jars)
         {
-            var jar = jars[i];
-            if (jar.appear < 1f)
-            {
-                jar.appear = Mathf.Min(1f, jar.appear + dt / Mathf.Max(0.05f, jarSwapTime));
-                jar.root.localScale = Vector3.one * Mathf.SmoothStep(0.2f, 1f, jar.appear);
-            }
-            jar.root.localPosition = Vector3.Lerp(jar.root.localPosition, jar.targetPos,
-                                                  1f - Mathf.Exp(-12f * dt));
+            jar.root.localPosition = Vector3.Lerp(jar.root.localPosition, jar.targetPos, k);
+            jar.root.localScale = Vector3.Lerp(jar.root.localScale, Vector3.one * jar.targetScale, k);
         }
 
         // the answer changes as pieces land, so it is asked every frame now
