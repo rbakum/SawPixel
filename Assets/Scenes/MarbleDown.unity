@@ -271,7 +271,7 @@ MonoBehaviour:
   pairChance: 0
   iceChance: 0
   energyChance: 0.035
-  jarCellsPerLevel: 2
+  jarCellsPerLevel: 0
   plainTopRows: 2
   beltSpeed: 0.07
   flightTime: 0.45

@@ -88,7 +88,7 @@ public class MarbleDown : MonoBehaviour
     [Range(0f, 0.3f)] public float pairChance = 0.0f;      // parked: a 2x1 needs two polygons merged
     [Range(0f, 0.4f)] public float iceChance = 0.0f;      // parked
     [Range(0f, 0.2f)] public float energyChance = 0.035f;
-    public int jarCellsPerLevel = 2;           // exactly this many, placed after the board is rolled
+    public int jarCellsPerLevel = 0;           // parked: bonus jars scattered on the board
     public int plainTopRows = 2;               // no specials this close to the entrance
 
     [Header("Conveyor")]
