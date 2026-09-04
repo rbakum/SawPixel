@@ -249,7 +249,7 @@ MonoBehaviour:
   visibleRows: 9
   boardFill: 0.96
   rowSquash: 0.78
-  scrollLead: 1
+  scrollLead: 0
   revealRadius: 6
   blockGap: 0.08
   outlineWidth: 0.05

@@ -43,7 +43,7 @@ public class MarbleDown : MonoBehaviour
     // 5.7 rows on screen; squashing them a little buys the rows back and, on
     // polygons, is invisible.
     [Range(0.6f, 1f)] public float rowSquash = 0.78f;
-    public int scrollLead = 1;                 // rows kept below the dig before the board moves
+    public int scrollLead = 0;                 // rows kept below the dig before the board moves
     public int revealRadius = 6;
     // How much a block shrinks inside its cell, so neighbours don't touch. This is
     // an ABSOLUTE margin, not a scale: a 2x1 loses the same edge as a 1x1, or the
@@ -173,6 +173,8 @@ public class MarbleDown : MonoBehaviour
         public Transform root;
         public readonly List<Cell> neighbours = new List<Cell>();   // shares an edge with these
         public Vector2[] shape;            // full region, local to the cell root; used for hit tests
+        public float topY;                 // highest point of `shape` in board coords; drives the cull
+        public bool hidden;                // fully above the HUD line, so not drawn and not clickable
         public Vector2[] inner;            // the same shape pulled in by the gap; what gets drawn
         public MeshRenderer floorMesh, outlineMesh, bodyMesh, iceMesh, nestMesh, nestMesh2;
         public SpriteRenderer icon;
@@ -678,7 +680,13 @@ public class MarbleDown : MonoBehaviour
                 cell.root.localPosition = new Vector3(site.x, site.y, 0f);
 
                 cell.shape = new Vector2[poly.Count];
-                for (int i = 0; i < poly.Count; i++) cell.shape[i] = poly[i] - site;   // local to the root
+                float hi = float.NegativeInfinity;
+                for (int i = 0; i < poly.Count; i++)
+                {
+                    cell.shape[i] = poly[i] - site;   // local to the root
+                    if (poly[i].y > hi) hi = poly[i].y;
+                }
+                cell.topY = hi;
                 cell.inner = Inset(cell.shape, cellSize * blockGap * 0.5f);
             }
 
@@ -1444,8 +1452,7 @@ public class MarbleDown : MonoBehaviour
         var hit = CellAt(local);
         if (hit == null) return;
 
-        // ignore anything still tucked under the HUD, including mid-scroll
-        if (hit.root.localPosition.y + scrollY > windowTop - cellH * 0.35f) return;
+        if (hit.hidden) return;                          // gone behind the HUD, so not clickable
         TryBreak(hit);
     }
 
@@ -1821,5 +1828,25 @@ public class MarbleDown : MonoBehaviour
         if (boardRoot == null) return;
         scrollY = Mathf.Lerp(scrollY, scrollTarget, 1f - Mathf.Exp(-8f * Time.deltaTime));
         boardRoot.localPosition = new Vector3(0f, scrollY, 0f);
+        CullAboveLine();
+    }
+
+    // A polygon sliding under the HUD used to be sliced by the band's straight
+    // edge, and the leftover sliver still took clicks. Now a cell goes away whole
+    // the instant any part of it would cross the line: what you see is what you
+    // can click.
+    void CullAboveLine()
+    {
+        for (int r = 0; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+            {
+                var cell = board[c, r];
+                if (cell.root == null) continue;
+
+                bool hide = cell.topY + scrollY > boardTopY;
+                if (hide == cell.hidden) continue;
+                cell.hidden = hide;
+                cell.root.gameObject.SetActive(!hide);
+            }
     }
 }
