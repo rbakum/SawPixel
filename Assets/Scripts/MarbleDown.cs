@@ -73,6 +73,10 @@ public class MarbleDown : MonoBehaviour
     public int jarCapacityMax = 4;
     public int piecesPerBlock = 1;
     public int jarSlots = 3;
+    // Small jars parked on the right showing which colours come next. They do not
+    // catch anything — they only let the player plan.
+    public int previewJars = 2;
+    [Range(0.3f, 0.9f)] public float previewScale = 0.6f;
 
     [Header("Board mix")]
     [Range(0f, 0.4f)] public float missingChance = 0.09f;
@@ -180,10 +184,12 @@ public class MarbleDown : MonoBehaviour
         public int filled;
         public int incoming;               // pieces already flying to this jar
         public bool bonus;
+        public bool preview;                   // waiting on the right, not catching anything yet
         public float appear;                   // 0..1 pop-in, so jars never swap in one frame
+        public Vector3 targetPos;              // slid towards, so the queue shuffles instead of snapping
         public Transform root;
-        public SpriteRenderer glass, lid, frame;
-        public TextMesh text;
+        public SpriteRenderer glass, lid, frame, payIcon;
+        public TextMesh text, payText;
     }
 
     class Piece
@@ -281,6 +287,7 @@ public class MarbleDown : MonoBehaviour
         pieceRoot = new GameObject("Pieces").transform;
         pieceRoot.SetParent(transform, false);
         for (int i = 0; i < jarSlots; i++) AddJar(false);
+        for (int i = 0; i < previewJars; i++) AddJar(false, true);
 
         RefreshBoard();
         RefreshHud();
@@ -1021,15 +1028,18 @@ public class MarbleDown : MonoBehaviour
 
     // ---- jars -------------------------------------------------------------
 
-    void AddJar(bool bonus)
+    void AddJar(bool bonus) => AddJar(bonus, false);
+
+    void AddJar(bool bonus, bool preview)
     {
         var jar = new Jar
         {
             color = PickJarColor(),
             capacity = Random.Range(Mathf.Min(jarCapacityMin, jarCapacityMax), Mathf.Max(jarCapacityMin, jarCapacityMax) + 1),
             bonus = bonus,
+            preview = preview,
         };
-        jar.root = new GameObject(bonus ? "BonusJar" : "Jar").transform;
+        jar.root = new GameObject(preview ? "NextJar" : bonus ? "BonusJar" : "Jar").transform;
         jar.root.SetParent(hudRoot, false);
 
         jar.frame = MakeSprite(jar.root, "Frame", roundedSprite, Z_JAR_FRAME);
@@ -1037,30 +1047,59 @@ public class MarbleDown : MonoBehaviour
         jar.glass = MakeSprite(jar.root, "Glass", jarSprite, Z_HUD);
         jar.lid = MakeSprite(jar.root, "Lid", blankSprite, Z_HUD_TOP);
         jar.text = MakeText(jar.root, "Count", Vector3.zero, Z_HUD_TEXT, halfH * 0.018f);
+        jar.payIcon = MakeSprite(jar.root, "PayIcon", energySprite, Z_HUD_TOP);
+        jar.payText = MakeText(jar.root, "Pay", Vector3.zero, Z_HUD_TEXT, halfH * 0.016f);
 
         jar.root.localScale = Vector3.one * 0.2f;      // grows in via UpdateFeel
-        jars.Add(jar);
+
+        // actives first, previews after — the order is what the layout walks
+        jars.Insert(preview ? jars.Count : FirstPreviewIndex(), jar);
         LayoutJars();
+        jar.root.localPosition = jar.targetPos;        // a new jar appears in place; the rest slide
     }
 
+    int FirstPreviewIndex()
+    {
+        for (int i = 0; i < jars.Count; i++)
+            if (jars[i].preview) return i;
+        return jars.Count;
+    }
+
+    // Big jars on the left, the small "coming next" ones after them. Positions are
+    // targets, not placements — UpdateFeel slides everything, so a finished jar
+    // leaving makes the queue shuffle left instead of teleporting.
     void LayoutJars()
     {
         float y = 0.82f * halfH;
-        float w = Mathf.Min(0.20f * halfH, 1.5f * halfW / Mathf.Max(1, jars.Count));
-        float step = w * 1.25f;
-        float x0 = -step * (jars.Count - 1) * 0.5f;
 
-        for (int i = 0; i < jars.Count; i++)
+        float units = 0f;
+        foreach (var jar in jars) units += jar.preview ? previewScale : 1f;
+        float w = Mathf.Min(0.20f * halfH, 1.55f * halfW / Mathf.Max(0.01f, units + 0.25f * (jars.Count - 1)));
+        float spacing = w * 0.25f;
+
+        float total = spacing * (jars.Count - 1);
+        foreach (var jar in jars) total += w * (jar.preview ? previewScale : 1f);
+
+        float x = -total * 0.5f;
+        foreach (var jar in jars)
         {
-            var jar = jars[i];
-            jar.root.localPosition = new Vector3(x0 + i * step, y, 0f);
+            float jw = w * (jar.preview ? previewScale : 1f);
+            jar.targetPos = new Vector3(x + jw * 0.5f, y, 0f);
+            x += jw + spacing;
 
-            FitSprite(jar.glass, jarSprite, w * 0.82f, w * 0.90f);
-            FitSprite(jar.frame, roundedSprite, w * 1.10f, w * 1.20f);
-            FitSprite(jar.lid, blankSprite, w * 0.74f, w * 0.24f);
-            jar.lid.transform.localPosition = new Vector3(0f, w * 0.38f, 0f);
-            jar.text.transform.localPosition = new Vector3(0f, w * 0.38f, 0f);
-            jar.text.characterSize = w * 0.048f;
+            FitSprite(jar.glass, jarSprite, jw * 0.82f, jw * 0.90f);
+            FitSprite(jar.frame, roundedSprite, jw * 1.10f, jw * 1.20f);
+            FitSprite(jar.lid, blankSprite, jw * 0.74f, jw * 0.24f);
+            jar.lid.transform.localPosition = new Vector3(0f, jw * 0.38f, 0f);
+            jar.text.transform.localPosition = new Vector3(0f, jw * 0.38f, 0f);
+            jar.text.characterSize = jw * 0.048f;
+
+            // reward sits under the jar, next to a lightning bolt so it never
+            // reads as "pieces still needed"
+            FitSprite(jar.payIcon, energySprite, jw * 0.30f, jw * 0.30f);
+            jar.payIcon.transform.localPosition = new Vector3(-jw * 0.20f, -jw * 0.58f, 0f);
+            jar.payText.transform.localPosition = new Vector3(jw * 0.16f, -jw * 0.58f, 0f);
+            jar.payText.characterSize = jw * 0.042f;
         }
         RefreshJars();
     }
@@ -1080,8 +1119,13 @@ public class MarbleDown : MonoBehaviour
             jar.lid.color = BLOCK_COLORS[jar.color];
             jar.glass.color = Color.Lerp(BLOCK_COLORS[jar.color], Color.white, 0.35f);
             jar.frame.enabled = jar.bonus;
-            jar.text.text = (jar.capacity - jar.filled).ToString();
+
+            // a preview only says which colour is coming, nothing else
+            jar.text.text = jar.preview ? "" : (jar.capacity - jar.filled).ToString();
             jar.text.color = new Color(0.15f, 0.05f, 0.10f);
+            jar.payText.text = jar.preview ? "" : jar.capacity.ToString();
+            jar.payText.color = new Color(1f, 0.86f, 0.45f);
+            jar.payIcon.enabled = !jar.preview;
         }
     }
 
@@ -1094,8 +1138,20 @@ public class MarbleDown : MonoBehaviour
         SpawnMotes(jar.root.position, jar.capacity);
         fadingJars.Add(new Fading { root = jar.root, t = 0f });
 
-        if (!wasBonus) AddJar(false);      // permanent slots refill; the bonus one is spent
-        else LayoutJars();
+        if (wasBonus) LayoutJars();        // the bonus slot is spent, nothing takes its place
+        else
+        {
+            // the first of the waiting jars steps up, and a fresh one joins the
+            // back of the queue — everything between simply slides left
+            int next = FirstPreviewIndex();
+            if (next < jars.Count)
+            {
+                jars[next].preview = false;
+                AddJar(false, true);
+            }
+            else AddJar(false);
+            LayoutJars();
+        }
 
         RefreshHud();
         AssignPieces();
@@ -1135,9 +1191,13 @@ public class MarbleDown : MonoBehaviour
         for (int i = 0; i < jars.Count; i++)
         {
             var jar = jars[i];
-            if (jar.appear >= 1f) continue;
-            jar.appear = Mathf.Min(1f, jar.appear + dt / Mathf.Max(0.05f, jarSwapTime));
-            jar.root.localScale = Vector3.one * Mathf.SmoothStep(0.2f, 1f, jar.appear);
+            if (jar.appear < 1f)
+            {
+                jar.appear = Mathf.Min(1f, jar.appear + dt / Mathf.Max(0.05f, jarSwapTime));
+                jar.root.localScale = Vector3.one * Mathf.SmoothStep(0.2f, 1f, jar.appear);
+            }
+            jar.root.localPosition = Vector3.Lerp(jar.root.localPosition, jar.targetPos,
+                                                  1f - Mathf.Exp(-12f * dt));
         }
 
         // the answer changes as pieces land, so it is asked every frame now
@@ -1228,6 +1288,7 @@ public class MarbleDown : MonoBehaviour
     {
         foreach (var jar in jars)
         {
+            if (jar.preview) continue;         // not catching anything yet
             int need = jar.capacity - jar.filled - jar.incoming;
             for (int k = 0; k < need; k++)
             {
@@ -1537,6 +1598,7 @@ public class MarbleDown : MonoBehaviour
 
         foreach (var jar in jars)
         {
+            if (jar.preview) continue;
             int onBelt = 0;
             foreach (var piece in belt)
                 if (piece.color == jar.color) onBelt++;
