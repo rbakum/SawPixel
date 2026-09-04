@@ -65,12 +65,12 @@ public class MarbleDown : MonoBehaviour
     [Range(0f, 0.6f)] public float sizeVariety = 0.30f;
 
     [Header("Economy")]
-    public int startEnergy = 8;
+    public int startEnergy = 10;
     // Each jar asks for its own amount and pays exactly that back, so a block
     // (one piece, one click) is worth one energy — the economy breaks even and
     // everything you waste on a color nobody wants is a real loss.
-    public int jarCapacityMin = 2;
-    public int jarCapacityMax = 3;
+    public int jarCapacityMin = 3;
+    public int jarCapacityMax = 4;
     public int piecesPerBlock = 1;
     public int jarSlots = 3;
 

@@ -249,15 +249,15 @@ MonoBehaviour:
   visibleRows: 9
   boardFill: 0.96
   rowSquash: 0.78
-  polygonJitter: 0.4
-  sizeVariety: 0.3
   scrollLead: 1
   revealRadius: 6
   blockGap: 0.08
   outlineWidth: 0.05
-  startEnergy: 8
-  jarCapacityMin: 2
-  jarCapacityMax: 3
+  polygonJitter: 0.4
+  sizeVariety: 0.3
+  startEnergy: 10
+  jarCapacityMin: 3
+  jarCapacityMax: 4
   piecesPerBlock: 1
   jarSlots: 3
   missingChance: 0.09
