@@ -3,28 +3,36 @@ using UnityEngine;
 
 // "Marble Down" — a 5-wide, 25-deep shaft you dig from the top down to a door.
 //
-// Every click costs one energy and you start with eight, so digging alone runs
+// The digging is done with stones. Hold a finger on the board, slide the stone
+// along the lane under the HUD and let go: it drops, bounces and rolls through
+// whatever is already open, and every crystal it strikes on the way takes a hit.
+// A crystal cracks on the first hit and breaks on the second (hitsToBreak). The
+// stones are real 2D physics — see MarbleDown.Drop.cs.
+//
+// Every stone costs one energy and you start with eight, so digging alone runs
 // you dry. Energy comes back only from filled jars: each block you break throws
 // six pieces of its color onto the conveyor loop, jars pull matching pieces off
 // it, and a filled jar pays out. The question is never just "where do I dig" but
 // "what color do I dig next".
 //
 // Cell types beyond a plain block:
-//   * DOUBLE  — a block inside a block. The first click strips the outer shell and
-//               the inner one spreads to full size. Two clicks, two blocks' worth
-//               of pieces.
-//   * ICE     — not clickable until two of its neighbours are broken. The number
-//               on it counts down as they fall.
-//   * ENERGY  — free to click, and pays energy instead of costing it.
-//   * JAR     — opens a fourth, temporary jar slot that vanishes once filled. The
-//               way out when the conveyor is clogged with a color nobody wants.
-//   * MISSING — no block at all, a hole in the shaft. Nothing to break and no way
-//               through: the dig has to go around it.
+//   * DOUBLE  — a block inside a block. Breaking the outer shell lets the inner one
+//               spread to full size, and that one takes its own hits all over
+//               again. Two layers, two blocks' worth of pieces.
+//   * ICE     — stones bounce off it until two of its neighbours are broken. The
+//               number on it counts down as they fall.
+//   * ENERGY  — opens on a single hit and pays energy back.
+//   * JAR     — opens on a single hit and adds a fourth, temporary jar slot that
+//               vanishes once filled. The way out when the conveyor is clogged
+//               with a color nobody wants.
+//   * MISSING — no block at all, a hole in the shaft. Nothing to break and nothing
+//               to stop a stone either: it is drawn as empty, so it IS empty, and
+//               a stone that finds one falls straight through.
 //
 // Anything further than `revealRadius` from a broken cell hides behind a question
 // mark: you see the shape of the shaft, not what it is made of.
 [DisallowMultipleComponent]
-public class MarbleDown : MonoBehaviour
+public partial class MarbleDown : MonoBehaviour
 {
     [Header("Sprites")]
     public Sprite[] blockSprites;              // unused while the board is flat-coloured
@@ -49,8 +57,8 @@ public class MarbleDown : MonoBehaviour
     // an ABSOLUTE margin, not a scale: a 2x1 loses the same edge as a 1x1, or the
     // gap around long blocks would come out twice as wide.
     [Range(0f, 0.3f)] public float blockGap = 0.08f;
-    // White ring around anything the player may click this instant. Together with
-    // the light dimming it separates "on the front" from "actually clickable" —
+    // White ring around anything a stone dropped this instant could damage. Together
+    // with the light dimming it separates "on the front" from "actually hittable" —
     // iced cells are lit but not outlined.
     [Range(0f, 0.15f)] public float outlineWidth = 0.05f;
 
@@ -67,7 +75,7 @@ public class MarbleDown : MonoBehaviour
     [Header("Economy")]
     public int startEnergy = 10;
     // Each jar asks for its own amount and pays exactly that back, so a block
-    // (one piece, one click) is worth one energy — the economy breaks even and
+    // (one piece, one stone) is worth one energy — the economy breaks even and
     // everything you waste on a color nobody wants is a real loss.
     public int jarCapacityMin = 3;
     public int jarCapacityMax = 4;
@@ -101,7 +109,7 @@ public class MarbleDown : MonoBehaviour
     [Header("Feel")]
     public float jarSwapTime = 0.28f;          // a jar shrinks out / pops in over this
     public float moteTime = 0.55f;             // energy flying from a jar to the counter
-    public float floaterTime = 0.75f;          // the -1 / +N that rises off a click
+    public float floaterTime = 0.75f;          // the -1 / +N that rises off a drop or a break
 
     [Header("Seed")]
     public bool useFixedSeed;
@@ -114,7 +122,9 @@ public class MarbleDown : MonoBehaviour
     // The generated shapes must use the same figure or they will not line up.
     const float BLOCK_CORNER = 0.103f;
 
-    const int Z_FLOOR = -2, Z_OUTLINE = -1, Z_BODY = 0, Z_INNER = 1, Z_INNER2 = 2, Z_ICON = 3, Z_ICE = 4, Z_FOG = 5, Z_CELL_TEXT = 6;
+    // Cracks sit over every layer of a stone, nest included: a hit is a hit to the
+    // whole crystal, and cracks that stopped at the inner ring read as decoration.
+    const int Z_FLOOR = -2, Z_OUTLINE = -1, Z_BODY = 0, Z_INNER = 1, Z_INNER2 = 2, Z_CRACK = 3, Z_ICON = 4, Z_ICE = 5, Z_FOG = 6, Z_CELL_TEXT = 7;
     // The jar frame used to sit ABOVE the glass, so a bonus jar was painted over
     // as a solid gold block and its real color was invisible.
     const int Z_HUD_BG = 20, Z_HUD_PANEL = 21, Z_JAR_FRAME = 22, Z_HUD = 23, Z_HUD_TOP = 24;
@@ -152,8 +162,8 @@ public class MarbleDown : MonoBehaviour
     enum Kind { Block, Energy, JarCell, Missing }
 
     // Sits in `color` when the outermost layer is stone instead of a real block:
-    // it costs a click to chip off and pays nothing back. Two clicks, one piece,
-    // so every petrified stone is one energy gone for good.
+    // it takes its hits to chip off like any layer and pays nothing back, so every
+    // petrified stone is energy gone for good.
     const int STONE = -1;
 
     // How much heavier a phantom top-row site is than a real one. Above 1 its
@@ -171,7 +181,7 @@ public class MarbleDown : MonoBehaviour
         public Kind kind;
         public int color;
         // colors hiding under `color`, outermost first. One entry = a double cell,
-        // two = a rare triple. Each click peels exactly one layer.
+        // two = a rare triple. Breaking a layer peels exactly that one.
         public readonly List<int> nest = new List<int>();
         public bool ice;
         public Cell twin;                  // other half of a 2x1 block, null for a normal cell
@@ -181,11 +191,14 @@ public class MarbleDown : MonoBehaviour
 
         public Transform root;
         public readonly List<Cell> neighbours = new List<Cell>();   // shares an edge with these
-        public Vector2[] shape;            // full region, local to the cell root; used for hit tests
+        public Vector2[] shape;            // full region, local to the cell root; adjacency and the cull read it
         public float topY;                 // highest point of `shape` in board coords; drives the cull
-        public bool hidden;                // fully above the HUD line, so not drawn and not clickable
-        public Vector2[] inner;            // the same shape pulled in by the gap; what gets drawn
-        public MeshRenderer floorMesh, outlineMesh, bodyMesh, iceMesh, nestMesh, nestMesh2;
+        public bool hidden;                // fully above the board line, so not drawn and not solid
+        public Vector2[] inner;            // the same shape pulled in by the gap; what gets drawn, and what stones hit
+        public MeshRenderer floorMesh, outlineMesh, bodyMesh, iceMesh, nestMesh, nestMesh2, crackMesh;
+        public PolygonCollider2D solid;    // `inner` again, for the stones; off once broken or culled
+        public int hits;                   // hits taken by the current layer; it goes at HitsFor
+        public readonly List<Vector2> cracks = new List<Vector2>();   // where they landed, local to the root
         public SpriteRenderer icon;
     }
 
@@ -272,6 +285,7 @@ public class MarbleDown : MonoBehaviour
     public void Restart(int? withSeed = null)
     {
         if (withSeed.HasValue) { useFixedSeed = true; seed = withSeed.Value; }
+        ResetDrop();                       // before the Destroy below: that one waits for the end of the frame
         for (int i = transform.childCount - 1; i >= 0; i--) Destroy(transform.GetChild(i).gameObject);
         jars.Clear(); belt.Clear(); toJar.Clear();
         fadingJars.Clear(); motes.Clear(); floaters.Clear();
@@ -296,6 +310,7 @@ public class MarbleDown : MonoBehaviour
         MakeShapes();
         GenerateBoard();
         BuildBoardVisuals();
+        BuildDrop();
         BuildHud();
 
         energy = startEnergy;
@@ -387,14 +402,25 @@ public class MarbleDown : MonoBehaviour
         halfH = ORTHO_SIZE;
         halfW = ORTHO_SIZE * cam.aspect;
 
-        windowTop = 0.30f * halfH;
-        windowBottom = -0.99f * halfH;
-        boardTopY = windowTop - 0.03f * halfH;          // breathing room under the HUD
-
         // Size off the WIDTH: the board used to be capped by how many rows had to
         // fit, which left a third of the screen empty on both sides.
         cellSize = boardFill * 2f * halfW / Mathf.Max(1, boardWidth);
         cellH = cellSize * rowSquash;
+
+        // The HUD now ends right under the energy panel (its bottom edge sits at
+        // 0.3375 of halfH), and between it and the board runs the drop lane: an
+        // empty strip the next stone hangs in while you aim. It has to hold a whole
+        // stone with some air round it, so it is sized off the stone and the board
+        // starts under it. Most of it is the band that already sat empty under the
+        // panel; the board gives up about a quarter of a row for the rest. Nothing
+        // of the board can ever poke into the lane — cells are culled whole at
+        // boardTopY — so a stone spawned there never starts inside a crystal.
+        windowTop = 0.33f * halfH;
+        windowBottom = -0.99f * halfH;
+        pebbleR = pebbleRadius * cellSize;
+        float lane = 2f * pebbleR + 0.08f * cellSize;
+        boardTopY = Mathf.Min(windowTop - 0.03f * halfH, windowTop - lane);
+        dropY = (windowTop + boardTopY) * 0.5f;
 
         beltCenter = new Vector3(0f, 0.55f * halfH, 0f);
         beltRadius = 0.055f * halfH;
@@ -423,7 +449,7 @@ public class MarbleDown : MonoBehaviour
         PlaceIce();
     }
 
-    // A 2x1 block spans two cells and falls to a single click, so it clears twice
+    // A 2x1 block spans two cells and breaks as one, so it clears twice
     // the ground for the same energy. Both halves still pay out their piece, which
     // is what makes finding one worth a detour.
     void PlacePairs()
@@ -979,6 +1005,9 @@ public class MarbleDown : MonoBehaviour
         cell.iceMesh = MakePoly(cell.root, "Ice", Z_ICE);
         SetPoly(cell.iceMesh, cell.inner);
 
+        // built empty; DrawCracks fills it the first time a stone lands
+        cell.crackMesh = MakePoly(cell.root, "Cracks", Z_CRACK);
+
         cell.icon = MakeSprite(cell.root, "Icon", null, Z_ICON);
     }
 
@@ -1053,12 +1082,14 @@ public class MarbleDown : MonoBehaviour
         hudRoot = new GameObject("Hud").transform;
         hudRoot.SetParent(transform, false);
 
-        // opaque band so rows scrolling up slide behind the jars instead of over them
-        // down to boardTopY, not windowTop: the gap between them was exactly where
-        // the row you already dug through stayed visible as a sliver
+        // Opaque band so rows scrolling up slide behind the jars instead of over them.
+        // It used to reach all the way down to boardTopY, because the gap under it
+        // showed the row you had already dug through as a sliver. Cells are culled
+        // whole at boardTopY now, so that gap is guaranteed empty — and it is the
+        // drop lane, which has to stay visible. The band stops at windowTop.
         var band = MakeSprite(hudRoot, "HudBand", blankSprite, Z_HUD_BG);
-        band.transform.localPosition = new Vector3(0f, (halfH + boardTopY) * 0.5f, 0f);
-        FitSprite(band, blankSprite, halfW * 2f, halfH - boardTopY);
+        band.transform.localPosition = new Vector3(0f, (halfH + windowTop) * 0.5f, 0f);
+        FitSprite(band, blankSprite, halfW * 2f, halfH - windowTop);
         band.color = BG_COLOR;
 
         var shelf = MakeSprite(hudRoot, "Shelf", blankSprite, Z_HUD_PANEL);
@@ -1257,7 +1288,7 @@ public class MarbleDown : MonoBehaviour
         AssignPieces();
     }
 
-    // What a click just cost or paid, rising off the cell it happened on.
+    // What a drop just cost or a break paid, rising off where it happened.
     void SpawnFloater(Vector3 worldPos, string text, Color color)
     {
         var tm = MakeText(transform, "Floater", Vector3.zero, Z_HUD_TEXT + 2, cellSize * 0.075f);
@@ -1486,64 +1517,23 @@ public class MarbleDown : MonoBehaviour
         AssignPieces();
     }
 
-    // ---- input ------------------------------------------------------------
+    // ---- frame ------------------------------------------------------------
 
     void Update()
     {
-        HandleInput();
+        HandleInput();                    // aiming and letting go: MarbleDown.Drop.cs
         UpdatePieces(Time.deltaTime);
         UpdateFeel(Time.deltaTime);
         ScrollBoard();
+        UpdatePebbles(Time.deltaTime);
     }
 
-    void HandleInput()
+    // After every Update, so the stones are drawn where the interpolated bodies
+    // ended up and on top of wherever the scroll has just put the board.
+    void LateUpdate()
     {
-        if (finished) return;
-
-        bool pressed = Input.GetMouseButtonDown(0);
-        Vector3 screen = Input.mousePosition;
-        if (Input.touchCount > 0)
-        {
-            var t = Input.GetTouch(0);
-            pressed = t.phase == TouchPhase.Began;
-            screen = t.position;
-        }
-        if (!pressed) return;
-
-        screen.z = -cam.transform.position.z;
-        Vector3 world = cam.ScreenToWorldPoint(screen);
-        if (world.y > windowTop) return;                 // that's the HUD, not the board
-
-        var local = new Vector2(world.x, world.y - scrollY);
-        if (local.y < boardTopY - boardHeight * cellH) { TryExit(); return; }
-
-        var hit = CellAt(local);
-        if (hit == null) return;
-
-        if (hit.hidden) return;                          // gone behind the HUD, so not clickable
-        TryBreak(hit);
-    }
-
-    // Which polygon holds this point. Regions tile the board, so at most one does;
-    // the nearest centre is the fallback for a click that lands on a seam.
-    Cell CellAt(Vector2 local)
-    {
-        Cell nearest = null;
-        float best = cellSize * cellSize;
-
-        for (int r = 0; r < boardHeight; r++)
-            for (int c = 0; c < boardWidth; c++)
-            {
-                var cell = board[c, r];
-                if (cell.shape == null) continue;
-
-                Vector2 site = cell.root.localPosition;
-                if (PointInPoly(local - site, cell.shape)) return cell;
-
-                float d = (local - site).sqrMagnitude;
-                if (d < best) { best = d; nearest = cell; }
-            }
-        return nearest;
+        DrawPebbles();
+        DrawAim();
     }
 
     void TryExit()
@@ -1563,46 +1553,127 @@ public class MarbleDown : MonoBehaviour
 
     // ---- breaking ---------------------------------------------------------
 
-    // Touching the dug-out area. Iced cells count: they are part of the front even
-    // though they cannot be clicked yet, and dimming them made them look broken.
+    // Open to the sky: a stone let go from the lane can actually get to it. That
+    // used to mean "touching a dug-out cell", which was right for a finger and is
+    // wrong for a falling stone — a stone falls through holes as well as through
+    // what you dug, and the rows the scroll has culled above the board are sky
+    // too. Iced cells count: they are part of the front even though a stone only
+    // bounces off them yet, and dimming them made them look broken.
     bool Reachable(Cell cell)
     {
-        if (cell.broken || cell.kind == Kind.Missing) return false;
-        if (Touches(cell)) return true;
-        return cell.twin != null && !cell.twin.broken && Touches(cell.twin);   // either half opens the pair
+        if (cell.broken || cell.kind == Kind.Missing || cell.hidden) return false;
+        if (Exposed(cell)) return true;
+        return cell.twin != null && !cell.twin.broken && Exposed(cell.twin);   // either half opens the pair
     }
 
-    // Anything sharing an edge counts, however short that edge is. Going by grid
-    // position instead refused to open stones the player was plainly touching.
-    bool Touches(Cell cell)
+    bool Exposed(Cell cell) => exposed != null && exposed[cell.col, cell.row];
+
+    // Nothing a stone collides with: dug out, never there, or culled with the rows
+    // above the board.
+    static bool OpenAir(Cell cell) => cell.broken || cell.kind == Kind.Missing || cell.hidden;
+
+    // Flood the open air from above: the culled rows and any open cell of the top
+    // row are sky, and so is every open cell joined to them through an edge. A
+    // solid cell is exposed when it borders that air, or sits in the top row with
+    // nothing over it but the lane. Edges, not grid positions — the same polygon
+    // graph that decides everything else about who touches whom.
+    void ComputeExposure()
     {
-        if (cell.row == 0) return true;                  // the entrance is always open
-        foreach (var other in cell.neighbours)
-            if (other.broken) return true;
-        return false;
+        if (exposed == null || exposed.GetLength(0) != boardWidth || exposed.GetLength(1) != boardHeight)
+            exposed = new bool[boardWidth, boardHeight];
+
+        var sky = new bool[boardWidth, boardHeight];
+        var queue = new Queue<Cell>();
+        for (int r = 0; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+            {
+                var cell = board[c, r];
+                if (!cell.hidden && !(r == 0 && OpenAir(cell))) continue;
+                sky[c, r] = true;
+                queue.Enqueue(cell);
+            }
+
+        while (queue.Count > 0)
+        {
+            var cell = queue.Dequeue();
+            foreach (var other in cell.neighbours)
+            {
+                if (sky[other.col, other.row] || !OpenAir(other)) continue;
+                sky[other.col, other.row] = true;
+                queue.Enqueue(other);
+            }
+        }
+
+        for (int r = 0; r < boardHeight; r++)
+            for (int c = 0; c < boardWidth; c++)
+            {
+                var cell = board[c, r];
+                bool open = false;
+                if (!OpenAir(cell))
+                {
+                    open = r == 0;
+                    foreach (var other in cell.neighbours)
+                        if (sky[other.col, other.row]) { open = true; break; }
+                }
+                exposed[c, r] = open;
+            }
     }
 
-    // Both bonus cells are gifts, so neither charges for the click.
-    bool IsFree(Cell cell) => cell.kind == Kind.Energy || cell.kind == Kind.JarCell;
+    // Both bonus cells are gifts: a single hit opens them.
+    bool IsGift(Cell cell) => cell.kind == Kind.Energy || cell.kind == Kind.JarCell;
 
-    bool Clickable(Cell cell)
+    // A stone dropped now could do it damage — the white ring.
+    bool Hittable(Cell cell)
     {
         if (!Reachable(cell)) return false;
         return !cell.ice || cell.freedNeighbours >= 2;
     }
 
-    void TryBreak(Cell cell)
+    int HitsFor(Cell cell) => IsGift(cell) ? 1 : Mathf.Max(1, hitsToBreak);
+
+    // The two halves of a 2x1 break as one, so they keep one count between them.
+    static Cell Owner(Cell cell) => cell.twin != null && !cell.twinHead ? cell.twin : cell;
+
+    // One stone striking one crystal. `at` is where, local to the half that was
+    // struck. Every hit short of the last leaves a crack there; the last one breaks
+    // the layer exactly the way a click used to, and the next layer — if there is
+    // one — starts again from nothing. The stone itself is not stopped: the solver
+    // has already bounced it off this crystal by the time we hear of the contact,
+    // so a crystal that shatters still throws the stone back instead of letting it
+    // drop through.
+    void Hit(Cell cell, Vector2 at)
     {
-        if (!Clickable(cell)) return;
+        var owner = Owner(cell);
+        if (owner.broken || owner.kind == Kind.Missing) return;
+        if (owner.ice && owner.freedNeighbours < 2) return;       // frozen: the stone just bounces off
 
-        bool free = IsFree(cell);
-        if (!free && energy <= 0) return;
-        if (!free) energy--;
+        owner.hits++;
+        if (owner.hits < HitsFor(owner))
+        {
+            cell.cracks.Add(at);
+            DrawCracks(cell);
+            RefreshBoard();               // the worn tint, and it may be the first crack on the front
+            return;
+        }
 
+        ClearDamage(owner);
+        if (owner.twin != null) ClearDamage(owner.twin);
+        BreakLayer(owner);
+    }
+
+    void ClearDamage(Cell cell)
+    {
+        cell.hits = 0;
+        cell.cracks.Clear();
+    }
+
+    // What a click used to do, minus the paying for it: the energy went when the
+    // stone was let go.
+    void BreakLayer(Cell cell)
+    {
         // only say something when the energy actually moved: a jar cell is a gift,
         // and the new slot appearing in the HUD is its own receipt
         if (cell.kind == Kind.Energy) SpawnFloater(cell.root.position, "+1", GAIN_TEXT);
-        else if (!free) SpawnFloater(cell.root.position, "-1", COST_TEXT);
 
         switch (cell.kind)
         {
@@ -1650,6 +1721,7 @@ public class MarbleDown : MonoBehaviour
     void Opened(Cell cell)
     {
         deepestBroken = Mathf.Max(deepestBroken, cell.row);
+        SyncSolid(cell);                  // nothing left for a stone to hit
         foreach (var other in cell.neighbours) Bump(other);
     }
 
@@ -1660,15 +1732,22 @@ public class MarbleDown : MonoBehaviour
         if (cell.freedNeighbours >= 2) cell.ice = false;
     }
 
-    // You are only dead when you cannot pay for a move AND no free energy cell is
-    // in reach — clicking one of those costs nothing.
+    // Nothing is decided while a stone is still moving: it may yet break the last
+    // cell of the bottom row, or an energy cell, or the block whose piece fills a
+    // jar. Past that, you are dead when nothing a stone could reach can be damaged
+    // (the door shut), or when you cannot pay for another stone. A free bonus cell
+    // in reach used to keep you alive at zero; it cannot now — getting a stone to
+    // it costs the energy you do not have.
     void CheckLoss()
     {
         if (finished) return;
+        if (PebblesLive()) return;
 
-        // Walled in by holes with the door still shut. Without this the game just
-        // stops responding and never says why.
-        if (!DoorOpen() && !AnyClickable(false))
+        // Nothing left that a stone could crack, with the door still shut. Holes no
+        // longer wall anything off — a stone falls through them — so in practice
+        // this takes ice nobody can melt, but the game must still say so instead
+        // of just going quiet.
+        if (!DoorOpen() && !AnyHittable())
         {
             finished = true;
             statusText.text = "DEAD END";
@@ -1678,18 +1757,19 @@ public class MarbleDown : MonoBehaviour
 
         if (energy > 0) return;
         if (EnergyPending()) return;                     // the jars have not finished paying
-        if (AnyClickable(true)) return;                  // a free bonus cell is still in reach
 
         finished = true;
         statusText.text = "OUT OF ENERGY";
         statusText.color = new Color(1f, 0.45f, 0.45f);
     }
 
-    // Anything still owed: pieces in the air, energy in the air, or a jar the belt
-    // can already finish. Declaring a loss before all that settles was calling the
-    // game over while the payout was literally still flying across the screen.
+    // Anything still owed: a stone still falling, pieces in the air, energy in the
+    // air, or a jar the belt can already finish. Declaring a loss before all that
+    // settles was calling the game over while the payout was literally still
+    // flying across the screen.
     bool EnergyPending()
     {
+        if (PebblesLive()) return true;
         if (motes.Count > 0 || toJar.Count > 0) return true;
 
         foreach (var jar in jars)
@@ -1703,15 +1783,11 @@ public class MarbleDown : MonoBehaviour
         return false;
     }
 
-    bool AnyClickable(bool freeOnly)
+    bool AnyHittable()
     {
         for (int r = 0; r < boardHeight; r++)
             for (int c = 0; c < boardWidth; c++)
-            {
-                var cell = board[c, r];
-                if (freeOnly && !IsFree(cell)) continue;
-                if (Clickable(cell)) return true;
-            }
+                if (Hittable(board[c, r])) return true;
         return false;
     }
 
@@ -1719,6 +1795,7 @@ public class MarbleDown : MonoBehaviour
 
     void RefreshBoard()
     {
+        ComputeExposure();
         var dist = FogDistances();
 
         for (int r = 0; r < boardHeight; r++)
@@ -1743,11 +1820,22 @@ public class MarbleDown : MonoBehaviour
     // did not just darken — it dragged pink towards purple.
     static readonly Color DIM = new Color(0.66f, 0.66f, 0.66f, 1f);
 
+    // A cracked crystal also goes a shade darker, so "half gone" reads from across
+    // the board and not only from the lines on it. Alpha is left alone: the polygons
+    // are drawn with a blending shader and a scaled alpha would turn them see-through.
+    Color Worn(Color c, Cell cell)
+    {
+        var owner = Owner(cell);
+        float k = 1f - 0.22f * Mathf.Clamp01(owner.hits / (float)HitsFor(owner));
+        return new Color(c.r * k, c.g * k, c.b * k, c.a);
+    }
+
     void RefreshCell(Cell cell, int distance)
     {
         cell.outlineMesh.enabled = false;
         cell.iceMesh.enabled = false;
         cell.nestMesh.enabled = cell.nestMesh2.enabled = false;
+        cell.crackMesh.enabled = false;
 
         // a hole really is nothing: no floor either, the background is the abyss
         if (cell.kind == Kind.Missing)
@@ -1769,12 +1857,14 @@ public class MarbleDown : MonoBehaviour
 
         Color tint = Reachable(cell) ? Color.white : DIM;
         cell.bodyMesh.enabled = true;
+        // cracks show through the fog as well: they are damage, not information
+        cell.crackMesh.enabled = cell.cracks.Count > 0;
 
         // Far from the dig the stone is drawn blank grey: you can see the shape of
         // the shaft, not what it is cut from.
         if (distance > revealRadius)
         {
-            PolyColor(cell.bodyMesh, FOG_STONE * tint);
+            PolyColor(cell.bodyMesh, Worn(FOG_STONE * tint, cell));
             cell.icon.enabled = false;
             return;
         }
@@ -1783,7 +1873,7 @@ public class MarbleDown : MonoBehaviour
         Color fill = !isBlock ? OPEN_TILE
                    : cell.color == STONE ? SOLID_ROCK
                                          : BLOCK_COLORS[cell.color];
-        PolyColor(cell.bodyMesh, fill * tint);
+        PolyColor(cell.bodyMesh, Worn(fill * tint, cell));
 
         if (isBlock && cell.nest.Count > 0)
         {
@@ -1796,7 +1886,7 @@ public class MarbleDown : MonoBehaviour
             PolyColor(cell.nestMesh2, BLOCK_COLORS[cell.nest[1]] * tint);
         }
 
-        if (Clickable(cell))
+        if (Hittable(cell))
         {
             cell.outlineMesh.enabled = true;
             PolyColor(cell.outlineMesh, Color.white);
@@ -1818,7 +1908,7 @@ public class MarbleDown : MonoBehaviour
     }
 
     // Chebyshev distance to the nearest broken cell, with the entrance row counted
-    // as open so the top of the shaft is visible before the first click.
+    // as open so the top of the shaft is visible before the first stone.
     int[,] FogDistances()
     {
         var dist = new int[boardWidth, boardHeight];
@@ -1885,7 +1975,7 @@ public class MarbleDown : MonoBehaviour
         float offset = want - rowY;
 
         // Snap to whole cells. A free-floating offset left the top row sliced in
-        // half under the HUD, and half a cell still invited a click.
+        // half under the HUD, and half a cell still invited a hit.
         float lowest = boardTopY - (boardHeight + 1.5f) * cellH;
         float maxOffset = Mathf.Ceil(Mathf.Max(0f, windowBottom - lowest) / cellH) * cellH;
         return Mathf.Clamp(Mathf.Round(offset / cellH) * cellH, 0f, maxOffset);
@@ -1901,10 +1991,13 @@ public class MarbleDown : MonoBehaviour
 
     // A polygon sliding under the HUD used to be sliced by the band's straight
     // edge, and the leftover sliver still took clicks. Now a cell goes away whole
-    // the instant any part of it would cross the line: what you see is what you
-    // can click.
+    // the instant any part of it would cross the line: what you see is what is
+    // there. That includes its collider — a culled cell is sky to a falling stone,
+    // which is what keeps the drop lane free of anything a stone could spawn in —
+    // and it changes who is exposed, so the board is re-lit when anything flips.
     void CullAboveLine()
     {
+        bool changed = false;
         for (int r = 0; r < boardHeight; r++)
             for (int c = 0; c < boardWidth; c++)
             {
@@ -1915,6 +2008,9 @@ public class MarbleDown : MonoBehaviour
                 if (hide == cell.hidden) continue;
                 cell.hidden = hide;
                 cell.root.gameObject.SetActive(!hide);
+                SyncSolid(cell);
+                changed = true;
             }
+        if (changed) RefreshBoard();
     }
 }
